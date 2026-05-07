@@ -24,7 +24,7 @@ def init_db():
     conn.close()
 
 def get_db_connection():
-    return sqlite3.connect('users.db', check_same_thread=False)
+    return sqlite3.connect('/app/data/users.db', check_same_thread=False)
 
 def save_user(chat_id, user, pwd):
     conn = get_db_connection()
