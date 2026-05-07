@@ -16,7 +16,7 @@ client = Groq(api_key=GROQ_KEY)
 
 # --- 1. إدارة قاعدة البيانات ---
 def init_db():
-    conn = sqlite3.connect('users.db', check_same_thread=False)
+    conn = sqlite3.connect('app/data/users.db', check_same_thread=False)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users 
                  (chat_id INTEGER PRIMARY KEY, username TEXT, password TEXT)''')
