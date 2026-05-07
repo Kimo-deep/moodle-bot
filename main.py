@@ -66,19 +66,30 @@ def run_moodle_task(user, pwd):
         token_input = soup_login.find('input', {'name': 'logintoken'})
         
         if not token_input:
-            return "⚠️ تعذر العثور على توكن تسجيل الدخول، قد يكون الموقع تحت الصيانة."
+            return {"status": "error", "message": "⚠️ تعذر العثور على توكن تسجيل الدخول، قد يكون الموقع تحت الصيانة."}
             
         token = token_input['value']
         login_data = {'username': user, 'password': pwd, 'logintoken': token}
-        session.post(login_url, data=login_data, timeout=20)
+        login_response = session.post(login_url, data=login_data, timeout=20)
+
+        # التحقق من نجاح تسجيل الدخول:
+        # إذا أعاد الموقع صفحة تسجيل الدخول مجدداً (تحتوي على logintoken) فهذا يعني فشل الدخول
+        soup_after_login = BeautifulSoup(login_response.text, 'html.parser')
+        if soup_after_login.find('input', {'name': 'logintoken'}):
+            return {"status": "login_failed", "message": "❌ اسم المستخدم أو كلمة المرور غير صحيحة."}
 
         # جلب التقويم
         res = session.get(calendar_url, timeout=20)
         soup = BeautifulSoup(res.text, 'html.parser')
+
+        # تحقق إضافي: إذا ظهرت صفحة تسجيل الدخول عند جلب التقويم
+        if soup.find('input', {'name': 'logintoken'}):
+            return {"status": "login_failed", "message": "❌ اسم المستخدم أو كلمة المرور غير صحيحة."}
+
         events = soup.find_all('div', {'class': 'event'})
         
         if not events:
-            return "✅ لا توجد واجبات قادمة في التقويم حالياً. استمتع بوقتك!"
+            return {"status": "success", "message": "✅ لا توجد واجبات قادمة في التقويم حالياً. استمتع بوقتك!"}
 
         data_list = [f"📌 {e.get_text(separator=' | ', strip=True)}" for e in events]
         final_text = "\n\n".join(data_list)
@@ -91,21 +102,21 @@ def run_moodle_task(user, pwd):
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1
         )
-        return completion.choices[0].message.content
+        return {"status": "success", "message": completion.choices[0].message.content}
 
     except Exception as e:
         print(f"Error: {e}")
-        return "⚠️ عذراً، حدث خطأ أثناء الاتصال بمودل الجامعة. حاول لاحقاً."
+        return {"status": "error", "message": "⚠️ عذراً، حدث خطأ أثناء الاتصال بمودل الجامعة. حاول لاحقاً."}
 
 # --- 3. نظام الجدولة (التذكير التلقائي) ---
 def auto_job():
     users = get_all_users()
     for u in users:
         try:
-            report = run_moodle_task(u[1], u[2])
-            # نرسل فقط إذا وجد واجبات (تجنب الإزعاج إذا كان الرد "لا يوجد")
-            if "لا توجد واجبات" not in report:
-                bot.send_message(u[0], f"🔔 **تذكير تلقائي بالمواعيد القادمة:**\n\n{report}")
+            result = run_moodle_task(u[1], u[2])
+            # نرسل فقط إذا نجح تسجيل الدخول ووجدت واجبات (تجنب الإزعاج إذا كان الرد "لا يوجد")
+            if result["status"] == "success" and "لا توجد واجبات" not in result["message"]:
+                bot.send_message(u[0], f"🔔 **تذكير تلقائي بالمواعيد القادمة:**\n\n{result['message']}")
         except Exception as e:
             print(f"Error in auto_job for user {u[0]}: {e}")
 
@@ -123,8 +134,8 @@ def handle_commands(message):
     
     if user_data:
         bot.send_message(message.chat.id, "⏳ جاري فحص مودل الأقصى، لحظات...")
-        report = run_moodle_task(user_data[0], user_data[1])
-        bot.send_message(message.chat.id, report)
+        result = run_moodle_task(user_data[0], user_data[1])
+        bot.send_message(message.chat.id, result["message"])
     else:
         msg = bot.send_message(message.chat.id, "مرحباً بك! يرجى إرسال **الرقم الجامعي** للبدء:")
         bot.register_next_step_handler(msg, process_username)
@@ -136,11 +147,29 @@ def process_username(message):
 
 def process_password(message, username):
     password = message.text
+    bot.send_message(message.chat.id, "⏳ جاري التحقق من بياناتك، لحظات...")
+    result = run_moodle_task(username, password)
+
+    if result["status"] == "login_failed":
+        bot.send_message(message.chat.id, result["message"])
+        msg = bot.send_message(
+            message.chat.id,
+            "يرجى المحاولة مجدداً. أرسل **الرقم الجامعي** من البداية:"
+        )
+        bot.register_next_step_handler(msg, process_username)
+        return
+
+    if result["status"] == "error":
+        bot.send_message(message.chat.id, result["message"])
+        return
+
+    # تسجيل الدخول ناجح — حفظ البيانات وإرسال التقرير
     save_user(message.chat.id, username, password)
-    bot.send_message(message.chat.id, "✅ تم حفظ بياناتك بنجاح! جاري فحص الواجبات لأول مرة...")
-    report = run_moodle_task(username, password)
-    bot.send_message(message.chat.id, report)
+    bot.send_message(message.chat.id, "✅ تم التحقق من بياناتك وحفظها بنجاح! جاري فحص الواجبات لأول مرة...")
+    bot.send_message(message.chat.id, result["message"])
     bot.send_message(message.chat.id, "💡 سأقوم الآن بتذكيرك تلقائياً كل 6 ساعات في حال وجود واجبات جديدة.")
+
+
 
 # --- التشغيل الأساسي ---
 if __name__ == "__main__":
