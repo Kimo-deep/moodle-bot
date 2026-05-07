@@ -1,3 +1,4 @@
+import os
 import telebot
 import requests
 from bs4 import BeautifulSoup
@@ -16,6 +17,7 @@ client = Groq(api_key=GROQ_KEY)
 
 # --- 1. إدارة قاعدة البيانات ---
 def init_db():
+    os.makedirs('/app/data', exist_ok=True)
     conn = sqlite3.connect('/app/data/users.db', check_same_thread=False)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users 
