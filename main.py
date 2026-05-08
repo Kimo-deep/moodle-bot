@@ -179,11 +179,12 @@ def admin_pay(call):
     conn = get_db_connection()
     if mode == "VIP":
         conn.cursor().execute('UPDATE users SET is_vip=1 WHERE chat_id=?', (uid,))
+ bot.send_message(uid, "🎉 تم تفعيل اشتراكك ال VIP بنجاح!")
     else:
         new_exp = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
         conn.cursor().execute('UPDATE users SET expiry_date=?, is_vip=0 WHERE chat_id=?', (new_exp, uid))
     conn.commit(); conn.close()
-    bot.send_message(uid, "🎉 تم تفعيل اشتراكك بنجاح!")
+    bot.send_message(uid, "🎉  تم تفعيل اشتراكك الشهري بنجاح!")
     bot.answer_callback_query(call.id, "تم")
 
 # --- 6. التوقيت المجدول (كل 6 ساعات) ---
