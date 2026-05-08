@@ -18,7 +18,7 @@ IS_HOLIDAY = False
 # --- 2. إدارة قاعدة البيانات (ضمان بقاء البيانات) ---
 def init_db():
     # إنشاء اتصال بقاعدة البيانات (سيتم إنشاؤها إذا لم توجد)
-    conn = sqlite3.connect('users.db', check_same_thread=False)
+    conn = sqlite3.connect('/app/data/users.db', check_same_thread=False)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users 
                  (chat_id INTEGER PRIMARY KEY, 
@@ -30,7 +30,7 @@ def init_db():
     conn.close()
 
 def get_db_connection():
-    return sqlite3.connect('users.db', check_same_thread=False, timeout=20)
+    return sqlite3.connect('/app/data/users.db', check_same_thread=False, timeout=20)
 
 # --- 3. محرك المودل (تصنيف راداري دقيق) ---
 def run_moodle_engine(user, pwd):
