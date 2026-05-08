@@ -78,7 +78,7 @@ def run_moodle_engine(user, pwd):
             return {"status": "success", "message": "✅ لا يوجد تحديثات جديدة حالياً."}
 
         prompt = f"""
-        رتب هذا التقرير الأكاديمي. لا تغير التصنيفات:
+        رتب هذا التقرير الأكاديمي. لا تغير التصنيفات. واجعل بين التكليف والتكليف الي بعده space وطبق نفس الشيء على المحاضرات والاختبارات واللقاءات:
         📚 المحاضرات: {lectures if lectures else 'لا يوجد'}
         🎥 اللقاءات: {meetings if meetings else 'لا يوجد'}
         📝 الاختبارات: {exams if exams else 'لا يوجد'}
