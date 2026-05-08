@@ -18,24 +18,31 @@ BINANCE_PAY_ID = "983969145"
 bot = telebot.TeleBot(TOKEN)
 client = Groq(api_key=GROQ_KEY)
 
-# --- 1. إدارة قاعدة البيانات مع الإصلاح التلقائي ---
+# --- 1. إدارة قاعدة البيانات مع الإصلاح الشامل ---
 def init_db():
     os.makedirs('/app/data', exist_ok=True)
     conn = sqlite3.connect('/app/data/users.db', check_same_thread=False)
     c = conn.cursor()
     
-    # إنشاء الجدول الأساسي
-    c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (chat_id INTEGER PRIMARY KEY, username TEXT, password TEXT, 
-                  expiry_date TEXT)''')
+    # التأكد من وجود الجدول الأساسي بالحد الأدنى
+    c.execute('CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY)')
     
-    # إصلاح ذكي: إضافة عمود is_vip إذا لم يكن موجوداً (حل مشكلة no such column)
-    try:
-        c.execute('ALTER TABLE users ADD COLUMN is_vip INTEGER DEFAULT 0')
-        print("✅ تم تحديث قاعدة البيانات بنجاح.")
-    except sqlite3.OperationalError:
-        pass # العمود موجود مسبقاً
-        
+    # فحص وإضافة الأعمدة الناقصة واحداً تلو الآخر
+    columns_to_add = [
+        ('username', 'TEXT'),
+        ('password', 'TEXT'),
+        ('expiry_date', 'TEXT'),
+        ('is_vip', 'INTEGER DEFAULT 0')
+    ]
+    
+    for col_name, col_type in columns_to_add:
+        try:
+            c.execute(f'ALTER TABLE users ADD COLUMN {col_name} {col_type}')
+            print(f"✅ تم إضافة العمود بنجاح: {col_name}")
+        except sqlite3.OperationalError:
+            # العمود موجود مسبقاً، لا داعي للقلق
+            pass
+            
     conn.commit()
     conn.close()
 
@@ -90,20 +97,16 @@ def handle_admin_requests(call):
     action = data[0] 
     uid = data[1]
     
-    # خيار الإلغاء
     if action == "cancel":
         bot.answer_callback_query(call.id, "تم إلغاء الطلب")
         bot.edit_message_caption(call.message.caption + "\n\n❌ تم إلغاء الطلب من قبل المسؤول.", call.message.chat.id, call.message.message_id)
         return
 
-    # خيارات التفعيل
     mode = data[2]
     conn = None
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        
-        # إنشاء المستخدم إذا لم يكن موجوداً
         c.execute('INSERT OR IGNORE INTO users (chat_id) VALUES (?)', (uid,))
         
         if mode == "VIP":
@@ -117,9 +120,8 @@ def handle_admin_requests(call):
         conn.commit()
         conn.close()
         
-        # رسائل النجاح
-        bot.send_message(ADMIN_ID, f"✅ نجح التفعيل بنجاح للمستخدم: `{uid}`\nنوع الاشتراك: {res_text}", parse_mode="Markdown")
-        try: bot.send_message(uid, f"🎉 مبروك! قام المسؤول بتفعيل {res_text} لحسابك.")
+        bot.send_message(ADMIN_ID, f"✅ نجح التفعيل للمستخدم: `{uid}`\nالنوع: {res_text}", parse_mode="Markdown")
+        try: bot.send_message(uid, f"🎉 مبروك! تم تفعيل {res_text} لحسابك.")
         except: pass
             
         bot.answer_callback_query(call.id, "تم التفعيل")
@@ -127,7 +129,7 @@ def handle_admin_requests(call):
 
     except Exception as e:
         if conn: conn.close()
-        bot.send_message(ADMIN_ID, f"❌ فشل التفعيل للمستخدم {uid}. الخطأ: {e}")
+        bot.send_message(ADMIN_ID, f"❌ فشل التفعيل لـ {uid}. الخطأ: {e}")
 
 # --- 5. أوامر المستخدم ---
 @bot.message_handler(commands=['start'])
@@ -136,14 +138,14 @@ def start(message):
 
 @bot.message_handler(commands=['subscribe'])
 def subscribe(message):
-    text = f"💳 **طرق التفعيل (5 شيكل):**\n\n1️⃣ جوال باي: `0597599642` (ارسل الصورة)\n2️⃣ بينانس Pay ID: `{BINANCE_PAY_ID}` (ارسل الـ TXID)"
+    text = f"💳 **طرق التفعيل:**\n\n1️⃣ جوال باي: `0597599642`\n2️⃣ بينانس ID: `{BINANCE_PAY_ID}`"
     bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
 @bot.message_handler(commands=['check'])
 def handle_check(message):
     allowed, reason = check_access(message.chat.id)
     if not allowed:
-        bot.send_message(message.chat.id, "🚫 انتهى اشتراكك. للتجديد استخدم /subscribe")
+        bot.send_message(message.chat.id, "🚫 انتهى اشتراكك. استخدم /subscribe")
         return
     
     conn = get_db_connection()
@@ -151,21 +153,21 @@ def handle_check(message):
     conn.close()
 
     if user_data and user_data[0]:
-        bot.send_message(message.chat.id, f"🔍 جاري فحص المودل... ({reason})")
+        bot.send_message(message.chat.id, f"🔍 جاري الفحص... ({reason})")
         res = run_moodle_task(user_data[0], user_data[1])
         bot.send_message(message.chat.id, res["message"])
     else:
-        msg = bot.send_message(message.chat.id, "يرجى إرسال **الرقم الجامعي**:")
+        msg = bot.send_message(message.chat.id, "أرسل الرقم الجامعي:")
         bot.register_next_step_handler(msg, process_username)
 
 def process_username(message):
     user = message.text
-    msg = bot.send_message(message.chat.id, "يرجى إرسال **كلمة المرور**:")
+    msg = bot.send_message(message.chat.id, "أرسل كلمة المرور:")
     bot.register_next_step_handler(msg, lambda m: process_password(m, user))
 
 def process_password(message, user):
     pwd = message.text
-    bot.send_message(message.chat.id, "⏳ جاري التحقق من بياناتك...")
+    bot.send_message(message.chat.id, "⏳ جاري التحقق...")
     res = run_moodle_task(user, pwd)
     if res["status"] == "success":
         conn = get_db_connection()
@@ -177,14 +179,11 @@ def process_password(message, user):
 @bot.message_handler(content_types=['photo'])
 def handle_receipt(message):
     markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("✅ شهر", callback_data=f"act_{message.chat.id}_30"),
-        types.InlineKeyboardButton("🌟 VIP", callback_data=f"act_{message.chat.id}_VIP")
-    )
-    markup.add(types.InlineKeyboardButton("❌ إلغاء الطلب", callback_data=f"cancel_{message.chat.id}"))
-    
+    markup.add(types.InlineKeyboardButton("✅ شهر", callback_data=f"act_{message.chat.id}_30"),
+               types.InlineKeyboardButton("🌟 VIP", callback_data=f"act_{message.chat.id}_VIP"))
+    markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data=f"cancel_{message.chat.id}"))
     bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=f"📩 إيصال من `{message.chat.id}`", reply_markup=markup, parse_mode="Markdown")
-    bot.reply_to(message, "⏳ تم استلام الصورة، سيتم تفعيلك قريباً.")
+    bot.reply_to(message, "⏳ سيتم تفعيلك قريباً.")
 
 if __name__ == "__main__":
     init_db()
