@@ -4,7 +4,7 @@ from groq import Groq
 from datetime import datetime, timedelta
 from telebot import types
 
-# --- 1. الإعدادات والروابط (تأكد من صحتها) ---
+# --- 1. الإعدادات ---
 TOKEN = "8702727538:AAE4rcAcrLeo4Luf2DeLgv3qtMWh2bleKic"
 GROQ_KEY = "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"
 ADMIN_ID = 7840931571  
@@ -13,36 +13,28 @@ FREE_TRIAL_END = datetime(2026, 6, 1)
 
 bot = telebot.TeleBot(TOKEN)
 client = Groq(api_key=GROQ_KEY)
-IS_HOLIDAY = False  # وضع الإجازة الافتراضي
+IS_HOLIDAY = False 
 
-# --- 2. إدارة قاعدة البيانات ---
+# --- 2. قاعدة البيانات ---
 def init_db():
-    # إنشاء مجلد البيانات إذا لم يكن موجوداً (مهم للسيرفر)
-    if not os.path.exists('/app/data'):
-        os.makedirs('/app/data', exist_ok=True)
-        
+    os.makedirs('/app/data', exist_ok=True)
     conn = sqlite3.connect('/app/data/users.db', check_same_thread=False)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (chat_id INTEGER PRIMARY KEY, 
-                  username TEXT, 
-                  password TEXT, 
-                  expiry_date TEXT, 
-                  is_vip INTEGER DEFAULT 0)''')
-    conn.commit()
-    conn.close()
+                 (chat_id INTEGER PRIMARY KEY, username TEXT, password TEXT, 
+                  expiry_date TEXT, is_vip INTEGER DEFAULT 0)''')
+    conn.commit(); conn.close()
 
 def get_db_connection():
     return sqlite3.connect('/app/data/users.db', check_same_thread=False, timeout=20)
 
-# --- 3. محرك المودل والذكاء الاصطناعي (الفرز والترتيب) ---
+# --- 3. محرك المودل الذكي (التصنيف البرمجي الصارم) ---
 def run_moodle_engine(user, pwd):
     session = requests.Session()
     session.headers.update({'User-Agent': 'Mozilla/5.0'})
     login_url = "https://moodle.alaqsa.edu.ps/login/index.php"
     
     try:
-        # تسجيل الدخول للمودل
         r = session.get(login_url, timeout=20)
         token = BeautifulSoup(r.text, 'html.parser').find('input', {'name': 'logintoken'})['value']
         login_res = session.post(login_url, data={'username': user, 'password': pwd, 'logintoken': token}, timeout=20)
@@ -50,52 +42,57 @@ def run_moodle_engine(user, pwd):
         if "login" in login_res.url:
             return {"status": "fail", "message": "❌ بيانات الدخول للمودل خاطئة."}
 
-        # جلب الفعاليات القادمة
         cal_url = "https://moodle.alaqsa.edu.ps/calendar/view.php?view=upcoming"
         res = session.get(cal_url, timeout=20)
         soup = BeautifulSoup(res.text, 'html.parser')
         events = soup.find_all('div', {'class': 'event'})
         
-        relevant_info = []
+        # حاويات التصنيف (بواسطة الكود لمنع الخلط)
+        lectures, meetings, exams, assignments = [], [], [], []
+
         for e in events:
             txt = e.get_text(separator=' ', strip=True)
-            # فلترة: تخطي أي مهمة مكتوب بجانبها أنها محلولة أو مسلمة
+            link_tag = e.find('a', href=True)
+            link = link_tag['href'] if link_tag else ""
+            
+            # فلترة المهام المنجزة
             if any(word in txt for word in ["تم التسليم", "محلول", "Submitted", "تخطى"]):
                 continue
-            relevant_info.append(txt)
 
-        if not relevant_info:
-            return {"status": "success", "message": "✅ لا توجد تحديثات جديدة؛ جميع مهامك منجزة!"}
+            # التصنيف بناءً على نوع الرابط (أدق طريقة)
+            if "assign" in link:
+                assignments.append(txt)
+            elif "quiz" in link or "اختبار" in txt:
+                exams.append(txt)
+            elif any(x in link for x in ["bigbluebutton", "zoom", "meet"]):
+                meetings.append(txt)
+            else:
+                lectures.append(txt)
 
-        # إرسال البيانات للذكاء الاصطناعي مع تعليمات الترتيب الصارمة
+        if not (lectures or meetings or exams or assignments):
+            return {"status": "success", "message": "✅ كل شيء تمام! لا توجد مهام أو محاضرات جديدة حالياً."}
+
+        # إرسال القوائم الجاهزة للذكاء الاصطناعي للتنسيق فقط
         prompt = f"""
-        رتب هذه البيانات الأكاديمية لطالب جامعة الأقصى في تقرير منظم جداً:
+        رتب هذا التقرير بأسلوب احترافي للطالب. البيانات مصنفة بالفعل، التزم بالأقسام التالية ولا تنقل أي عنصر من قسمه:
         
-        الترتيب الإجباري للتقرير:
-        1. المحاضرات الجديدة (فقط الدروس المرفوعة).
-        2. اللقاءات المباشرة (روابط زووم/ميت القادمة - احذف أي موعد فات).
-        3. الامتحانات (الاختبارات والـ Quizzes القادمة).
-        4. التكاليف والواجبات (التي لم تسلم بعد).
-        
-        ملاحظة: لا تخلط بين الأقسام. إذا كان القسم فارغاً لا تذكره.
-        
-        البيانات الخام:
-        {' | '.join(relevant_info)}
+        📚 المحاضرات الجديدة: {lectures if lectures else 'لا يوجد'}
+        🎥 اللقاءات المباشرة: {meetings if meetings else 'لا يوجد'}
+        📝 الامتحانات القادمة: {exams if exams else 'لا يوجد'}
+        ⚠️ التكاليف والواجبات المطلوبة: {assignments if assignments assignment else 'لا يوجد'}
         """
         
         completion = client.chat.completions.create(
             model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": "أنت سكرتير أكاديمي دقيق جداً لا يخلط بين أنواع المهام."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1 # لضمان عدم الهلوسة أو الخلط
+            messages=[{"role": "system", "content": "أنت منسق تقارير ملتزم بالتصنيفات المعطاة لك حرفياً."},
+                      {"role": "user", "content": prompt}],
+            temperature=0.0
         )
         return {"status": "success", "message": completion.choices[0].message.content}
     except:
-        return {"status": "error", "message": "⚠️ عذراً، موقع المودل لا يستجيب حالياً."}
+        return {"status": "error", "message": "⚠️ موقع المودل لا يستجيب حالياً."}
 
-# --- 4. فحص الصلاحية ووضع الإجازة ---
+# --- 4. الصلاحيات والإجازة ---
 def check_access(chat_id):
     if datetime.now() < FREE_TRIAL_END: return True, "تجريبي"
     conn = get_db_connection()
@@ -113,16 +110,16 @@ def toggle_holiday(message):
     IS_HOLIDAY = "on" in message.text
     bot.reply_to(message, f"🏝️ تم {'تفعيل' if IS_HOLIDAY else 'إيقاف'} وضع الإجازة.")
 
-# --- 5. أوامر البوت الأساسية ---
+# --- 5. الأوامر الأساسية ---
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.send_message(message.chat.id, "🎓 **مرحباً بك في بوت مودل الأقصى الذكي**\n\nأنا هنا لأرتب لك محاضراتك، لقاءاتك، وواجباتك غير المحلولة.\n\nاستخدم /check للبدء.")
+    bot.send_message(message.chat.id, "🎓 **بوت مودل الأقصى المطور**\n\nأقوم بفحص المحاضرات والواجبات المتبقية وترتيبها لك بدقة.\n\nاستخدم /check للبدء.")
 
 @bot.message_handler(commands=['check'])
 def manual_check(message):
     allowed, _ = check_access(message.chat.id)
     if not allowed:
-        bot.send_message(message.chat.id, "🚫 انتهى اشتراكك. للتفعيل: /subscribe")
+        bot.send_message(message.chat.id, "🚫 انتهى اشتراكك. للتجديد: /subscribe")
         return
     
     conn = get_db_connection()
@@ -130,7 +127,7 @@ def manual_check(message):
     conn.close()
     
     if u:
-        bot.send_message(message.chat.id, "🔍 جاري الفحص والترتيب...")
+        bot.send_message(message.chat.id, "🔍 جاري الفحص والترتيب الدقيق...")
         res = run_moodle_engine(u[0], u[1])
         bot.send_message(message.chat.id, res["message"])
     else:
@@ -144,28 +141,27 @@ def process_user_step(message):
 
 def finish_registration(message, user):
     pwd = message.text
-    bot.send_message(message.chat.id, "⏳ جاري التحقق من البيانات...")
+    bot.send_message(message.chat.id, "⏳ جاري التحقق من المودل...")
     res = run_moodle_engine(user, pwd)
     if res["status"] == "success":
         conn = get_db_connection()
         conn.cursor().execute('INSERT OR REPLACE INTO users (chat_id, username, password) VALUES (?,?,?)', (message.chat.id, user, pwd))
         conn.commit(); conn.close()
-        bot.send_message(message.chat.id, "✅ تم الربط بنجاح! إليك تقريرك:\n\n" + res["message"])
-    else:
-        bot.send_message(message.chat.id, res["message"])
+        bot.send_message(message.chat.id, "✅ تم الحفظ! إليك تقريرك:\n\n" + res["message"])
+    else: bot.send_message(message.chat.id, res["message"])
 
-# --- 6. نظام الدفع والاشتراك ---
+# --- 6. الدفع والاشتراك ---
 @bot.message_handler(commands=['subscribe'])
 def subscribe(message):
-    bot.send_message(message.chat.id, f"💳 **لتفعيل الاشتراك (5 شيكل):**\n\n1️⃣ جوال باي: `0597599642`\n2️⃣ بينانس ID: `{BINANCE_PAY_ID}`\n\nارسل صورة الإيصال هنا.")
+    bot.send_message(message.chat.id, f"💳 **التفعيل (5 شيكل):**\n\n1️⃣ جوال باي: `0597599642`\n2️⃣ بينانس ID: `{BINANCE_PAY_ID}`\n\nارسل صورة الإيصال هنا.")
 
 @bot.message_handler(content_types=['photo'])
 def handle_receipt(message):
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✅ تفعيل شهر", callback_data=f"act_{message.chat.id}_30"),
-               types.InlineKeyboardButton("🌟 تفعيل VIP", callback_data=f"act_{message.chat.id}_VIP"))
+    markup.add(types.InlineKeyboardButton("✅ شهر", callback_data=f"act_{message.chat.id}_30"),
+               types.InlineKeyboardButton("🌟 VIP", callback_data=f"act_{message.chat.id}_VIP"))
     bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=f"📩 إيصال من: `{message.chat.id}`", reply_markup=markup)
-    bot.reply_to(message, "⏳ تم استلام إيصالك، سيتم التفعيل من قبل الإدارة فوراً.")
+    bot.reply_to(message, "⏳ تم استلام إيصالك، سيتم التفعيل قريباً.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('act_'))
 def admin_confirm(call):
@@ -183,9 +179,8 @@ def admin_confirm(call):
     bot.send_message(uid, f"🎉 مبروك! تم تفعيل اشتراكك ({info}).")
     bot.answer_callback_query(call.id, "تم التفعيل")
 
-# --- 7. الجدولة التلقائية ---
+# --- 7. الجدولة ---
 def auto_scheduler():
-    # إرسال التقرير اليومي الساعة 8:00 صباحاً
     schedule.every().day.at("08:00").do(daily_broadcast)
     while True:
         schedule.run_pending()
@@ -201,10 +196,9 @@ def daily_broadcast():
         if allowed:
             res = run_moodle_engine(user, pwd)
             if res["status"] == "success":
-                try: bot.send_message(uid, f"🔔 **تقرير الصباح المنظم:**\n\n{res['message']}", parse_mode="Markdown")
+                try: bot.send_message(uid, f"🔔 **تقريرك المنظم اليوم:**\n\n{res['message']}", parse_mode="Markdown")
                 except: pass
 
-# --- التشغيل ---
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=auto_scheduler, daemon=True).start()
