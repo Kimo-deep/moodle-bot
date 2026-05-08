@@ -108,7 +108,7 @@ def admin_activate(call):
 
 @bot.message_handler(commands=['subscribe'])
 def sub(message):
-    text = "💳 **طرق الدفع:**\n1- جوال باي: حول لـ `059xxxxxxx` وارسل الصورة.\n2- بينانس: حول لـ Pay ID `1234567` وارسل **رقم العملية (TXID)** هنا للتحقق التلقائي."
+    text = "💳 **طرق الدفع:**\n1- جوال باي: حول لـ `0597599642` وارسل الصورة.\n2- بينانس: حول لـ Pay ID `983969145` وارسل **رقم العملية (TXID)** هنا للتحقق التلقائي."
     bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
 @bot.message_handler(commands=['check'])
