@@ -1,4 +1,3 @@
-
 import os
 import telebot
 import requests
@@ -7,7 +6,6 @@ from groq import Groq
 import sqlite3
 import time
 import threading
-import schedule
 from datetime import datetime, timedelta
 from telebot import types
 
@@ -20,19 +18,29 @@ BINANCE_PAY_ID = "983969145"
 bot = telebot.TeleBot(TOKEN)
 client = Groq(api_key=GROQ_KEY)
 
-# --- 1. إدارة قاعدة البيانات ---
+# --- 1. إدارة قاعدة البيانات مع الإصلاح التلقائي ---
 def init_db():
     os.makedirs('/app/data', exist_ok=True)
     conn = sqlite3.connect('/app/data/users.db', check_same_thread=False)
     c = conn.cursor()
+    
+    # إنشاء الجدول الأساسي
     c.execute('''CREATE TABLE IF NOT EXISTS users 
                  (chat_id INTEGER PRIMARY KEY, username TEXT, password TEXT, 
-                  expiry_date TEXT, is_vip INTEGER DEFAULT 0)''')
+                  expiry_date TEXT)''')
+    
+    # إصلاح ذكي: إضافة عمود is_vip إذا لم يكن موجوداً (حل مشكلة no such column)
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN is_vip INTEGER DEFAULT 0')
+        print("✅ تم تحديث قاعدة البيانات بنجاح.")
+    except sqlite3.OperationalError:
+        pass # العمود موجود مسبقاً
+        
     conn.commit()
     conn.close()
 
 def get_db_connection():
-    # حل مشكلة database is locked عبر إضافة timeout لانتظار القاعدة
+    # حل مشكلة database is locked عبر إضافة timeout
     return sqlite3.connect('/app/data/users.db', check_same_thread=False, timeout=20)
 
 # --- 2. محرك المودل (Moodle Engine) ---
@@ -64,7 +72,6 @@ def run_moodle_task(user, pwd):
 
 # --- 3. فحص الصلاحية ---
 def check_access(chat_id):
-    # متاح مجاناً حتى هذا التاريخ لجميع المستخدمين
     if datetime.now() < datetime(2026, 6, 1): return True, "تجريبي"
     conn = get_db_connection()
     res = conn.cursor().execute('SELECT expiry_date, is_vip FROM users WHERE chat_id=?', (chat_id,)).fetchone()
@@ -74,64 +81,29 @@ def check_access(chat_id):
         if res[0] and datetime.strptime(res[0], '%Y-%m-%d %H:%M:%S') > datetime.now(): return True, "مشترك"
     return False, None
 
-# --- 4. لوحة التحكم والإدارة ---
-@bot.message_handler(commands=['panel'])
-def admin_panel(message):
-    if int(message.from_user.id) != int(ADMIN_ID): return
-    conn = get_db_connection()
-    total = conn.cursor().execute('SELECT COUNT(*) FROM users').fetchone()[0]
-    vips = conn.cursor().execute('SELECT COUNT(*) FROM users WHERE is_vip = 1').fetchone()[0]
-    conn.close()
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("➕ إضافة VIP يدوي", callback_data="admin_add_vip"))
-    bot.send_message(ADMIN_ID, f"📊 **إحصائيات النظام**\n\n👥 الطلاب المسجلين: {total}\n🌟 أعضاء VIP: {vips}", reply_markup=markup, parse_mode="Markdown")
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_add_vip")
-def admin_add_vip_step(call):
-    msg = bot.send_message(ADMIN_ID, "أرسل ID الطالب لإضافته VIP:")
-    bot.register_next_step_handler(msg, process_manual_vip)
-
-def process_manual_vip(message):
-    uid = message.text.strip()
-    if uid.isdigit():
-        conn = None
-        try:
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute('INSERT OR IGNORE INTO users (chat_id) VALUES (?)', (uid,))
-            c.execute('UPDATE users SET is_vip = 1 WHERE chat_id = ?', (uid,))
-            conn.commit(); conn.close()
-            bot.send_message(ADMIN_ID, f"✅ نجح تفعيل VIP يدوي للمستخدم: `{uid}`", parse_mode="Markdown")
-            try: bot.send_message(uid, "🌟 مبروك! منحك المدير اشتراك VIP مدى الحياة.")
-            except: pass
-        except Exception as e:
-            if conn: conn.close()
-            bot.send_message(ADMIN_ID, f"❌ حدث خطأ أثناء التفعيل اليدوي: {e}")
-    else: bot.send_message(ADMIN_ID, "❌ ID غير صالح.")
-
-# --- 5. نظام التفعيل الذكي والأزرار (المعدل) ---
+# --- 4. نظام التعامل مع الطلبات (الآدمن) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith('act_') or call.data.startswith('cancel_'))
-def handle_admin_actions(call):
+def handle_admin_requests(call):
     if int(call.from_user.id) != int(ADMIN_ID): return
     
     data = call.data.split('_')
-    action = data[0] # act أو cancel
+    action = data[0] 
     uid = data[1]
     
-    # خيار الإلغاء (رفض الطلب)
+    # خيار الإلغاء
     if action == "cancel":
         bot.answer_callback_query(call.id, "تم إلغاء الطلب")
         bot.edit_message_caption(call.message.caption + "\n\n❌ تم إلغاء الطلب من قبل المسؤول.", call.message.chat.id, call.message.message_id)
         return
 
     # خيارات التفعيل
-    mode = data[2] # 30 أو VIP
+    mode = data[2]
     conn = None
     try:
         conn = get_db_connection()
         c = conn.cursor()
         
-        # التأكد من وجود المستخدم في القاعدة
+        # إنشاء المستخدم إذا لم يكن موجوداً
         c.execute('INSERT OR IGNORE INTO users (chat_id) VALUES (?)', (uid,))
         
         if mode == "VIP":
@@ -142,26 +114,22 @@ def handle_admin_actions(call):
             c.execute('UPDATE users SET expiry_date = ?, is_vip = 0 WHERE chat_id = ?', (new_exp, uid))
             res_text = "اشتراك لمدة شهر"
         
-        conn.commit(); conn.close()
+        conn.commit()
+        conn.close()
         
-        # رسالة نجاح للآدمن بالرقم التعريفي
+        # رسائل النجاح
         bot.send_message(ADMIN_ID, f"✅ نجح التفعيل بنجاح للمستخدم: `{uid}`\nنوع الاشتراك: {res_text}", parse_mode="Markdown")
-        
-        # رسالة تهنئة للمستخدم
-        try:
-            bot.send_message(uid, f"🎉 مبروك! قام المسؤول بتفعيل {res_text} لحسابك بنجاح.")
-        except:
-            bot.send_message(ADMIN_ID, f"⚠️ تم التفعيل، لكن لم تصل رسالة للمستخدم {uid}.")
+        try: bot.send_message(uid, f"🎉 مبروك! قام المسؤول بتفعيل {res_text} لحسابك.")
+        except: pass
             
-        bot.answer_callback_query(call.id, "تم التفعيل بنجاح")
-        bot.edit_message_caption(call.message.caption + f"\n\n✅ تم تفعيل: {res_text}", call.message.chat.id, call.message.message_id)
+        bot.answer_callback_query(call.id, "تم التفعيل")
+        bot.edit_message_caption(call.message.caption + f"\n\n✅ الحالة: تم التفعيل ({res_text})", call.message.chat.id, call.message.message_id)
 
     except Exception as e:
         if conn: conn.close()
         bot.send_message(ADMIN_ID, f"❌ فشل التفعيل للمستخدم {uid}. الخطأ: {e}")
-        bot.answer_callback_query(call.id, "خطأ فني")
 
-# --- 6. أوامر المستخدم والمودل ---
+# --- 5. أوامر المستخدم ---
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.reply_to(message, "مرحباً بك في بوت مودل الأقصى! 🎓\nالبوت مجاني تماماً حتى شهر 6/2026.\nاستخدم /check لبدء فحص واجباتك.")
@@ -177,8 +145,12 @@ def handle_check(message):
     if not allowed:
         bot.send_message(message.chat.id, "🚫 انتهى اشتراكك. للتجديد استخدم /subscribe")
         return
-    user_data = get_db_connection().cursor().execute('SELECT username, password FROM users WHERE chat_id=?', (message.chat.id,)).fetchone()
-    if user_data:
+    
+    conn = get_db_connection()
+    user_data = conn.cursor().execute('SELECT username, password FROM users WHERE chat_id=?', (message.chat.id,)).fetchone()
+    conn.close()
+
+    if user_data and user_data[0]:
         bot.send_message(message.chat.id, f"🔍 جاري فحص المودل... ({reason})")
         res = run_moodle_task(user_data[0], user_data[1])
         bot.send_message(message.chat.id, res["message"])
@@ -211,12 +183,9 @@ def handle_receipt(message):
     )
     markup.add(types.InlineKeyboardButton("❌ إلغاء الطلب", callback_data=f"cancel_{message.chat.id}"))
     
-    bot.send_photo(ADMIN_ID, message.photo[-1].file_id, 
-                   caption=f"📩 إيصال من `{message.chat.id}`", 
-                   reply_markup=markup, parse_mode="Markdown")
+    bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=f"📩 إيصال من `{message.chat.id}`", reply_markup=markup, parse_mode="Markdown")
     bot.reply_to(message, "⏳ تم استلام الصورة، سيتم تفعيلك قريباً.")
 
 if __name__ == "__main__":
     init_db()
-    print("🚀 البوت يعمل بكامل الخصائص الجديدة!")
     bot.infinity_polling()
