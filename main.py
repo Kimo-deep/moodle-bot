@@ -13,7 +13,7 @@ import os
 # --- الإعدادات ---
 TOKEN = "8702727538:AAE4rcAcrLeo4Luf2DeLgv3qtMWh2bleKic"
 GROQ_KEY = "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"
-ADMIN_ID = 123456789  # !!! ضع الـ ID الخاص بك هنا لكي تصلك الإيصالات وتتحكم بالبوت !!!
+ADMIN_ID = 7840931571  # !!! ضع الـ ID الخاص بك هنا لكي تصلك الإيصالات وتتحكم بالبوت !!!
 
 bot = telebot.TeleBot(TOKEN)
 client = Groq(api_key=GROQ_KEY)
