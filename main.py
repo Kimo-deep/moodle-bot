@@ -83,6 +83,8 @@ def run_moodle_engine(user, pwd):
         🎥 اللقاءات: {meetings if meetings else 'لا يوجد'}
         📝 الاختبارات: {exams if exams else 'لا يوجد'}
         ⚠️ التكاليف والتجارب: {assignments if assignments else 'لا يوجد'}
+
+اجعل مسافة بين المعلومة والاخرى مثلا لا تجهل التكاليف ملتصقة في بعضها البعض اجعل بينهم مسافة لمعرفة ان هذا تكليف يختلف عن الذي قبله
         """
         
         completion = client.chat.completions.create(
