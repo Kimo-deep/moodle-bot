@@ -77,7 +77,7 @@ def check_access(chat_id):
         if res[0] and datetime.strptime(res[0], '%Y-%m-%d %H:%M:%S') > datetime.now(): return True, "مشترك"
     return False, None
 
-# --- 4. لوحة التحكم (Admin Panel) ---
+# --- 4. لوحة التحكم والإدارة (المعدلة) ---
 @bot.message_handler(commands=['panel'])
 def admin_panel(message):
     if int(message.from_user.id) != int(ADMIN_ID): return
@@ -97,16 +97,60 @@ def admin_add_vip_step(call):
 def process_manual_vip(message):
     uid = message.text.strip()
     if uid.isdigit():
-        conn = get_db_connection()
-        conn.cursor().execute('INSERT OR IGNORE INTO users (chat_id) VALUES (?)', (uid,))
-        conn.cursor().execute('UPDATE users SET is_vip = 1 WHERE chat_id = ?', (uid,))
-        conn.commit(); conn.close()
-        bot.send_message(ADMIN_ID, f"✅ تم تفعيل VIP للمعرف {uid}")
-        try: bot.send_message(uid, "🌟 مبروك! منحك المدير اشتراك VIP مدى الحياة.")
-        except: pass
+        try:
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('INSERT OR IGNORE INTO users (chat_id) VALUES (?)', (uid,))
+            c.execute('UPDATE users SET is_vip = 1 WHERE chat_id = ?', (uid,))
+            conn.commit(); conn.close()
+            bot.send_message(ADMIN_ID, f"✅ نجح التفعيل! المستخدم {uid} أصبح VIP الآن.")
+            try: bot.send_message(uid, "🌟 مبروك! منحك المدير اشتراك VIP مدى الحياة.")
+            except: pass
+        except Exception as e:
+            bot.send_message(ADMIN_ID, f"❌ حدث خطأ أثناء تفعيل {uid}: {e}")
     else: bot.send_message(ADMIN_ID, "❌ ID غير صالح.")
 
-# --- 5. أوامر المستخدم والدفع ---
+# --- 5. نظام التفعيل الذكي عبر الأزرار (المعدل) ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith('act_'))
+def admin_confirm(call):
+    if int(call.from_user.id) != int(ADMIN_ID): return
+    
+    _, uid, mode = call.data.split('_')
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    try:
+        # إنشاء السطر للمستخدم إذا لم يكن موجوداً
+        c.execute('INSERT OR IGNORE INTO users (chat_id) VALUES (?)', (uid,))
+        
+        if mode == "VIP":
+            c.execute('UPDATE users SET is_vip = 1, expiry_date = NULL WHERE chat_id = ?', (uid,))
+            res_text = "VIP مدى الحياة"
+        else:
+            new_exp = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+            c.execute('UPDATE users SET expiry_date = ?, is_vip = 0 WHERE chat_id = ?', (new_exp, uid))
+            res_text = "اشتراك شهر (30 يوم)"
+        
+        conn.commit()
+        conn.close()
+        
+        # رسالة نجاح للآدمن
+        bot.send_message(ADMIN_ID, f"✅ تم تفعيل {res_text} بنجاح للمستخدم: `{uid}`", parse_mode="Markdown")
+        
+        # رسالة تهنئة للمستخدم
+        try:
+            bot.send_message(uid, f"🎉 مبروك! قام المدير بتفعيل {res_text} لحسابك.")
+        except:
+            bot.send_message(ADMIN_ID, f"⚠️ تم التفعيل، لكن لم تصل رسالة للمستخدم {uid} (ربما لم يضغط Start).")
+            
+        bot.answer_callback_query(call.id, "تم التفعيل بنجاح")
+        bot.edit_message_caption(call.message.caption + f"\n\n✅ الحالة: تم تفعيل {res_text}", call.message.chat.id, call.message.message_id)
+
+    except Exception as e:
+        bot.send_message(ADMIN_ID, f"❌ فشل التفعيل للمستخدم {uid}. الخطأ: {e}")
+        bot.answer_callback_query(call.id, "خطأ في التفعيل")
+
+# --- 6. أوامر المستخدم ---
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.reply_to(message, "مرحباً بك في بوت مودل الأقصى! 🎓\nالبوت مجاني تماماً حتى شهر 6/2026.\nاستخدم /check لبدء فحص واجباتك.")
@@ -155,34 +199,17 @@ def handle_receipt(message):
     bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=f"📩 إيصال من `{message.chat.id}`", reply_markup=markup, parse_mode="Markdown")
     bot.reply_to(message, "⏳ تم استلام الصورة، سيتم تفعيلك قريباً.")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('act_'))
-def admin_confirm(call):
-    if int(call.from_user.id) != int(ADMIN_ID): return
-    _, uid, mode = call.data.split('_')
-    conn = get_db_connection()
-    if mode == "VIP":
-        conn.cursor().execute('UPDATE users SET is_vip = 1 WHERE chat_id = ?', (uid,))
-        msg = "VIP مدى الحياة"
-    else:
-        new_exp = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
-        conn.cursor().execute('UPDATE users SET expiry_date = ?, is_vip = 0 WHERE chat_id = ?', (new_exp, uid))
-        msg = "اشتراك شهر"
-    conn.commit(); conn.close()
-    try: bot.send_message(uid, f"🎉 مبروك! تم تفعيل {msg} بنجاح.")
-    except: pass
-    bot.answer_callback_query(call.id, "تم التفعيل")
-    bot.edit_message_caption(call.message.caption + f"\n✅ تم التفعيل: {msg}", call.message.chat.id, call.message.message_id)
-
-# --- 6. الجدولة ---
+# --- 7. الجدولة (تنبيهات تلقائية) ---
 def auto_check_all():
     conn = get_db_connection()
-    users = conn.cursor().execute('SELECT chat_id, username, password FROM users').fetchall()
+    users = conn.cursor().execute('SELECT chat_id, username, password FROM users WHERE username IS NOT NULL').fetchall()
     conn.close()
     for u in users:
         if check_access(u[0])[0]:
             res = run_moodle_task(u[1], u[2])
             if res["status"] == "success" and "لا توجد واجبات" not in res["message"]:
-                bot.send_message(u[0], "🔔 **تذكير بالواجبات:**\n\n" + res["message"])
+                try: bot.send_message(u[0], "🔔 **تذكير بالواجبات:**\n\n" + res["message"])
+                except: pass
 
 def scheduler_loop():
     schedule.every(6).hours.do(auto_check_all)
@@ -192,5 +219,5 @@ def scheduler_loop():
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=scheduler_loop, daemon=True).start()
+    print("🚀 البوت قيد التشغيل والآدمن مفعل.")
     bot.infinity_polling()
-    
