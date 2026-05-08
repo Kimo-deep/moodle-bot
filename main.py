@@ -102,7 +102,7 @@ def send_welcome(message):
 @bot.message_handler(commands=['subscribe'])
 def subscribe(message):
     text = "💳 **طرق الاشتراك (5 شيكل شهرياً):**\n\n"
-    text += "1️⃣ **جوال باي:** حول لـ `059xxxxxxx` وارسل الصورة.\n"
+    text += "1️⃣ **جوال باي:** حول لـ `0597599642` وارسل الصورة.\n"
     text += "2️⃣ **بينانس:** حول لـ Pay ID `12345678` وارسل الصورة.\n\n"
     text += "🎁 البوت مجاني حالياً لجميع الطلاب."
     bot.send_message(message.chat.id, text, parse_mode="Markdown")
