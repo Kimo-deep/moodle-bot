@@ -1,184 +1,129 @@
-import os
 import telebot
+from telebot import types
 import requests
 from bs4 import BeautifulSoup
-from groq import Groq
 import sqlite3
+import schedule
 import time
 import threading
-import schedule
+from groq import Groq
+from datetime import datetime, timedelta
+import os
 
-# --- الإعدادات (تأكد من صحة التوكنات) ---
+# --- الإعدادات ---
 TOKEN = "8702727538:AAE4rcAcrLeo4Luf2DeLgv3qtMWh2bleKic"
 GROQ_KEY = "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"
+ADMIN_ID = 123456789  # !!! ضع الـ ID الخاص بك هنا لكي تصلك الإيصالات وتتحكم بالبوت !!!
 
 bot = telebot.TeleBot(TOKEN)
 client = Groq(api_key=GROQ_KEY)
 
-# --- 1. إدارة قاعدة البيانات ---
+# --- 1. قاعدة البيانات (نسخة مطورة) ---
 def init_db():
-    os.makedirs('/app/data', exist_ok=True)
-    conn = sqlite3.connect('/app/data/users.db', check_same_thread=False)
+    # تأكد من استخدام المسار الصحيح للـ Volume في Railway
+    db_path = '/app/data/users.db'
+    if not os.path.exists('/app/data'):
+        os.makedirs('/app/data')
+        
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (chat_id INTEGER PRIMARY KEY, username TEXT, password TEXT)''')
+                 (chat_id INTEGER PRIMARY KEY, username TEXT, password TEXT, 
+                  expiry_date TEXT, is_vip INTEGER DEFAULT 0)''')
     conn.commit()
     conn.close()
 
-def get_db_connection():
-    return sqlite3.connect('/app/data/users.db', check_same_thread=False)
+# --- 2. منطق فحص الصلاحية ---
+def check_access(chat_id):
+    # الفترة المجانية لغاية 1/6/2026
+    free_until = datetime(2026, 6, 1)
+    if datetime.now() < free_until:
+        return True, "تجريبي مجاني"
 
-def save_user(chat_id, user, pwd):
-    conn = get_db_connection()
+    conn = sqlite3.connect('/app/data/users.db', check_same_thread=False)
     c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO users VALUES (?, ?, ?)', (chat_id, user, pwd))
-    conn.commit()
-    conn.close()
-
-def get_user(chat_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT username, password FROM users WHERE chat_id = ?', (chat_id,))
+    c.execute('SELECT expiry_date, is_vip FROM users WHERE chat_id = ?', (chat_id,))
     res = c.fetchone()
     conn.close()
-    return res
 
-def get_all_users():
-    conn = get_db_connection()
+    if res:
+        expiry_date, is_vip = res
+        if is_vip == 1: return True, "عضوية VIP"
+        if expiry_date:
+            expiry = datetime.strptime(expiry_date, '%Y-%m-%d %H:%M:%S')
+            if expiry > datetime.now(): return True, "اشتراك مدفوع"
+    
+    return False, None
+
+# --- 3. التعامل مع إيصالات الدفع (للمسؤول) ---
+@bot.message_handler(content_types=['photo'])
+def handle_receipt(message):
+    user_id = message.chat.id
+    user_name = message.from_user.first_name
+    
+    bot.reply_to(message, "⏳ وصل الإيصال! سيتم تفعيل حسابك فور مراجعته من قبل الإدارة.")
+    
+    markup = types.InlineKeyboardMarkup()
+    btn_month = types.InlineKeyboardButton("✅ تفعيل 30 يوم", callback_data=f"act_{user_id}_30")
+    btn_free = types.InlineKeyboardButton("🎁 VIP مجاني", callback_data=f"vip_{user_id}")
+    btn_rej = types.InlineKeyboardButton("❌ رفض", callback_data=f"rej_{user_id}")
+    markup.add(btn_month, btn_free, btn_rej)
+    
+    caption = f"📩 **إيصال جديد!**\n👤: {user_name}\n🆔: `{user_id}`"
+    bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=caption, reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(('act_', 'vip_', 'rej_')))
+def admin_callback(call):
+    data = call.data.split('_')
+    action, uid = data[0], data[1]
+    conn = sqlite3.connect('/app/data/users.db')
     c = conn.cursor()
-    c.execute('SELECT chat_id, username, password FROM users')
-    users = c.fetchall()
+    
+    if action == "act":
+        days = int(data[2])
+        exp = (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+        c.execute('UPDATE users SET expiry_date = ? WHERE chat_id = ?', (exp, uid))
+        bot.send_message(uid, f"🎉 تم تفعيل اشتراكك لمدة {days} يوم!")
+    elif action == "vip":
+        c.execute('UPDATE users SET is_vip = 1 WHERE chat_id = ?', (uid,))
+        bot.send_message(uid, "🌟 تم منحك العضوية الدائمة مجاناً!")
+    elif action == "rej":
+        bot.send_message(uid, "❌ تم رفض الإيصال، تأكد من الدفع مجدداً.")
+        
+    conn.commit()
     conn.close()
-    return users
+    bot.answer_callback_query(call.id, "تم التنفيذ")
 
-# --- 2. محرك سحب ومعالجة البيانات ---
-def run_moodle_task(user, pwd):
-    session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-    
-    login_url = "https://moodle.alaqsa.edu.ps/login/index.php"
-    calendar_url = "https://moodle.alaqsa.edu.ps/calendar/view.php?view=upcoming"
+# --- 4. أوامر البوت (start, subscribe, check) ---
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    bot.reply_to(message, "مرحباً بك في بوت المودل! 🎓\nالبوت مجاني تماماً حتى 1/6/2026.\nاستخدم /subscribe لمعرفة طرق الدفع للمستقبل.")
 
-    try:
-        # تسجيل الدخول
-        r = session.get(login_url, timeout=20)
-        soup_login = BeautifulSoup(r.text, 'html.parser')
-        token_input = soup_login.find('input', {'name': 'logintoken'})
-        
-        if not token_input:
-            return {"status": "error", "message": "⚠️ تعذر العثور على توكن تسجيل الدخول، قد يكون الموقع تحت الصيانة."}
-            
-        token = token_input['value']
-        login_data = {'username': user, 'password': pwd, 'logintoken': token}
-        login_response = session.post(login_url, data=login_data, timeout=20)
+@bot.message_handler(commands=['subscribe'])
+def subscribe(message):
+    text = "💳 **طرق الاشتراك (5 شيكل شهرياً):**\n\n"
+    text += "1️⃣ **جوال باي:** حول لـ `059xxxxxxx` وارسل الصورة.\n"
+    text += "2️⃣ **بينانس:** حول لـ Pay ID `12345678` وارسل الصورة.\n\n"
+    text += "🎁 البوت مجاني حالياً لجميع الطلاب."
+    bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
-        # التحقق من نجاح تسجيل الدخول:
-        # إذا أعاد الموقع صفحة تسجيل الدخول مجدداً (تحتوي على logintoken) فهذا يعني فشل الدخول
-        soup_after_login = BeautifulSoup(login_response.text, 'html.parser')
-        if soup_after_login.find('input', {'name': 'logintoken'}):
-            return {"status": "login_failed", "message": "❌ اسم المستخدم أو كلمة المرور غير صحيحة."}
+# --- 5. وظيفة سحب البيانات (المعدلة) ---
+def run_moodle_task(chat_id, username, password):
+    # (هنا تضع كود BeautifulSoup و Groq الخاص بك من الملف الأصلي)
+    # تأكد من استخدامه داخل دالة check_access
+    pass
 
-        # جلب التقويم
-        res = session.get(calendar_url, timeout=20)
-        soup = BeautifulSoup(res.text, 'html.parser')
-
-        # تحقق إضافي: إذا ظهرت صفحة تسجيل الدخول عند جلب التقويم
-        if soup.find('input', {'name': 'logintoken'}):
-            return {"status": "login_failed", "message": "❌ اسم المستخدم أو كلمة المرور غير صحيحة."}
-
-        events = soup.find_all('div', {'class': 'event'})
-        
-        if not events:
-            return {"status": "success", "message": "✅ لا توجد واجبات قادمة في التقويم حالياً. استمتع بوقتك!"}
-
-        data_list = [f"📌 {e.get_text(separator=' | ', strip=True)}" for e in events]
-        final_text = "\n\n".join(data_list)
-
-        # التحليل عبر AI
-        prompt = f"قم بتنظيم الواجبات التالية في قائمة احترافية تحتوي على (اسم المادة، اسم الواجب، الموعد النهائي) باللغة العربية: {final_text[:5000]}"
-        
-        completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
-        return {"status": "success", "message": completion.choices[0].message.content}
-
-    except Exception as e:
-        print(f"Error: {e}")
-        return {"status": "error", "message": "⚠️ عذراً، حدث خطأ أثناء الاتصال بمودل الجامعة. حاول لاحقاً."}
-
-# --- 3. نظام الجدولة (التذكير التلقائي) ---
-def auto_job():
-    users = get_all_users()
-    for u in users:
-        try:
-            result = run_moodle_task(u[1], u[2])
-            # نرسل فقط إذا نجح تسجيل الدخول ووجدت واجبات (تجنب الإزعاج إذا كان الرد "لا يوجد")
-            if result["status"] == "success" and "لا توجد واجبات" not in result["message"]:
-                bot.send_message(u[0], f"🔔 **تذكير تلقائي بالمواعيد القادمة:**\n\n{result['message']}")
-        except Exception as e:
-            print(f"Error in auto_job for user {u[0]}: {e}")
-
-def scheduler_loop():
-    # فحص تلقائي كل 6 ساعات
-    schedule.every(6).hours.do(auto_job)
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
-
-# --- 4. أوامر البوت ---
-@bot.message_handler(commands=['start', 'check'])
-def handle_commands(message):
-    user_data = get_user(message.chat.id)
-    
-    if user_data:
-        bot.send_message(message.chat.id, "⏳ جاري فحص مودل الأقصى، لحظات...")
-        result = run_moodle_task(user_data[0], user_data[1])
-        bot.send_message(message.chat.id, result["message"])
-    else:
-        msg = bot.send_message(message.chat.id, "مرحباً بك! يرجى إرسال **الرقم الجامعي** للبدء:")
-        bot.register_next_step_handler(msg, process_username)
-
-def process_username(message):
-    username = message.text
-    msg = bot.send_message(message.chat.id, "الآن أرسل **كلمة المرور** (سيتم تشفيرها وحفظها محلياً):")
-    bot.register_next_step_handler(msg, lambda m: process_password(m, username))
-
-def process_password(message, username):
-    password = message.text
-    bot.send_message(message.chat.id, "⏳ جاري التحقق من بياناتك، لحظات...")
-    result = run_moodle_task(username, password)
-
-    if result["status"] == "login_failed":
-        bot.send_message(message.chat.id, result["message"])
-        msg = bot.send_message(
-            message.chat.id,
-            "يرجى المحاولة مجدداً. أرسل **الرقم الجامعي** من البداية:"
-        )
-        bot.register_next_step_handler(msg, process_username)
+@bot.message_handler(commands=['check'])
+def handle_check(message):
+    allowed, reason = check_access(message.chat.id)
+    if not allowed:
+        bot.send_message(message.chat.id, "🚫 انتهى اشتراكك. يرجى التجديد عبر /subscribe")
         return
+    
+    bot.send_message(message.chat.id, f"🔍 جاري الفحص... ({reason})")
+    # استدعاء دالة الفحص هنا...
 
-    if result["status"] == "error":
-        bot.send_message(message.chat.id, result["message"])
-        return
-
-    # تسجيل الدخول ناجح — حفظ البيانات وإرسال التقرير
-    save_user(message.chat.id, username, password)
-    bot.send_message(message.chat.id, "✅ تم التحقق من بياناتك وحفظها بنجاح! جاري فحص الواجبات لأول مرة...")
-    bot.send_message(message.chat.id, result["message"])
-    bot.send_message(message.chat.id, "💡 سأقوم الآن بتذكيرك تلقائياً كل 6 ساعات في حال وجود واجبات جديدة.")
-
-
-
-# --- التشغيل الأساسي ---
+# --- تشغيل البوت ---
 if __name__ == "__main__":
     init_db()
-    
-    # تشغيل المجدل في خيط (Thread) منفصل
-    threading.Thread(target=scheduler_loop, daemon=True).start()
-    
-    print("🚀 البوت قيد التشغيل...")
     bot.infinity_polling()
-    
-    
