@@ -164,28 +164,54 @@ def save_user_data(message, user):
 def subscribe(message):
     bot.send_message(message.chat.id, f"💳 **تفعيل الاشتراك:**\nجوال باي: `0597599642`\nبينانس: `{BINANCE_PAY_ID}`\nارسل الإيصال هنا.")
 
+# --- تعديل نظام استلام الإيصالات (إضافة زر الرفض) ---
 @bot.message_handler(content_types=['photo'])
 def handle_payment(message):
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✅ شهر", callback_data=f"pay_{message.chat.id}_30"),
-               types.InlineKeyboardButton("🌟 VIP", callback_data=f"pay_{message.chat.id}_VIP"))
-    bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=f"📩 إيصال من: `{message.chat.id}`", reply_markup=markup)
-    bot.reply_to(message, "⏳ استلمنا الإيصال، سيتم التفعيل قريباً.")
+    # إضافة زر التفعيل وزر الرفض
+    markup.add(
+        types.InlineKeyboardButton("✅ تفعيل شهر", callback_data=f"pay_{message.chat.id}_30"),
+        types.InlineKeyboardButton("🌟 تفعيل VIP", callback_data=f"pay_{message.chat.id}_VIP")
+    )
+    markup.add(types.InlineKeyboardButton("❌ رفض الطلب (وهمي)", callback_data=f"rej_{message.chat.id}"))
+    
+    bot.send_photo(ADMIN_ID, message.photo[-1].file_id, 
+                   caption=f"📩 **طلب تفعيل جديد**\n👤 المستخدم: `{message.chat.id}`\n📅 التاريخ: {datetime.now().strftime('%Y-%m-%d')}", 
+                   reply_markup=markup)
+    bot.reply_to(message, "⏳ تم إرسال إيصالك للآدمن. سيتم إشعارك فور مراجعته.")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('pay_'))
-def admin_pay(call):
+# --- تعديل معالج الأزرار للآدمن (التفعيل والرفض) ---
+@bot.callback_query_handler(func=lambda call: True)
+def admin_actions(call):
     if call.from_user.id != ADMIN_ID: return
-    _, uid, mode = call.data.split('_')
-    conn = get_db_connection()
-    if mode == "VIP":
-        conn.cursor().execute('UPDATE users SET is_vip=1 WHERE chat_id=?', (uid,))
- bot.send_message(uid, "🎉 تم تفعيل اشتراكك ال VIP بنجاح!")
-    else:
-        new_exp = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
-        conn.cursor().execute('UPDATE users SET expiry_date=?, is_vip=0 WHERE chat_id=?', (new_exp, uid))
-    conn.commit(); conn.close()
-    bot.send_message(uid, "🎉  تم تفعيل اشتراكك الشهري بنجاح!")
-    bot.answer_callback_query(call.id, "تم")
+    
+    data = call.data.split('_')
+    action = data[0] # pay أو rej
+    uid = data[1] # ID المستخدم
+    
+    if action == "pay":
+        mode = data[2]
+        conn = get_db_connection()
+        if mode == "VIP":
+            conn.cursor().execute('UPDATE users SET is_vip=1 WHERE chat_id=?', (uid,))
+            msg_text = "🌟 تم تفعيل اشتراكك VIP مدى الحياة!"
+        else:
+            new_exp = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+            conn.cursor().execute('UPDATE users SET expiry_date=?, is_vip=0 WHERE chat_id=?', (new_exp, uid))
+            msg_text = "✅ تم تفعيل اشتراكك لمدة شهر بنجاح!"
+        conn.commit()
+        conn.close()
+        
+        bot.send_message(uid, msg_text)
+        bot.edit_message_caption(f"✅ تم التفعيل للمستخدم `{uid}`", call.message.chat.id, call.message.message_id)
+        
+    elif action == "rej":
+        # في حال الرفض
+        bot.send_message(uid, "❌ نعتذر، تم رفض طلب التفعيل الخاص بك. يرجى التأكد من إرسال إيصال صحيح أو التواصل مع الدعم.")
+        bot.edit_message_caption(f"❌ تم رفض طلب المستخدم `{uid}` (طلب وهمي)", call.message.chat.id, call.message.message_id)
+    
+    bot.answer_callback_query(call.id)
+
 
 # --- 6. التوقيت المجدول (كل 6 ساعات) ---
 def auto_reports():
