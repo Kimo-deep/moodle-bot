@@ -30,7 +30,7 @@ def init_db():
     conn.close()
 
 def get_db_connection():
-    return sqlite3.connect('users.db', check_same_thread=False, timeout=20)
+    return sqlite3.connect('/app/data/users.db', check_same_thread=False, timeout=20)
 
 # --- 3. محرك المودل (تصنيف راداري دقيق) ---
 def run_moodle_engine(user, pwd):
