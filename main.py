@@ -138,7 +138,7 @@ def start(message):
 
 @bot.message_handler(commands=['subscribe'])
 def subscribe(message):
-    text = "💳 **التفعيل (5 شيكل):**\n1- جوال باي: `0597599642` (ارسل الصورة)\n2- بينانس Pay ID: `8702727538` (ارسل الـ TXID)"
+    text = "💳 **التفعيل (5 شيكل):**\n1- جوال باي: `0597599642` (ارسل الصورة)\n2- بينانس Pay ID: `983969145` (ارسل الـ TXID)"
     bot.send_message(message.chat.id, text)
 
 @bot.message_handler(commands=['check'])
