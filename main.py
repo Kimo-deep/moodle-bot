@@ -9,25 +9,30 @@ TOKEN = "8702727538:AAE4rcAcrLeo4Luf2DeLgv3qtMWh2bleKic"
 GROQ_KEY = "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"
 ADMIN_ID = 7840931571  
 BINANCE_PAY_ID = "983969145"
-FREE_TRIAL_END = datetime(2026, 6, 1)
+FREE_TRIAL_END = datetime(2026, 6, 1) # فترة تجريبية مجانية للجميع
 
 bot = telebot.TeleBot(TOKEN)
 client = Groq(api_key=GROQ_KEY)
 IS_HOLIDAY = False 
 
-# --- 2. إدارة قاعدة البيانات ---
+# --- 2. إدارة قاعدة البيانات (ضمان بقاء البيانات) ---
 def init_db():
+    # إنشاء اتصال بقاعدة البيانات (سيتم إنشاؤها إذا لم توجد)
     conn = sqlite3.connect('users.db', check_same_thread=False)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (chat_id INTEGER PRIMARY KEY, username TEXT, password TEXT, 
-                  expiry_date TEXT, is_vip INTEGER DEFAULT 0)''')
-    conn.commit(); conn.close()
+                 (chat_id INTEGER PRIMARY KEY, 
+                  username TEXT, 
+                  password TEXT, 
+                  expiry_date TEXT, 
+                  is_vip INTEGER DEFAULT 0)''')
+    conn.commit()
+    conn.close()
 
 def get_db_connection():
     return sqlite3.connect('users.db', check_same_thread=False, timeout=20)
 
-# --- 3. محرك المودل (منطق الفرز الراداري الصارم) ---
+# --- 3. محرك المودل (تصنيف راداري دقيق) ---
 def run_moodle_engine(user, pwd):
     session = requests.Session()
     session.headers.update({'User-Agent': 'Mozilla/5.0'})
@@ -39,7 +44,7 @@ def run_moodle_engine(user, pwd):
         login_res = session.post(login_url, data={'username': user, 'password': pwd, 'logintoken': token}, timeout=20)
         
         if "login" in login_res.url:
-            return {"status": "fail", "message": "❌ بيانات الدخول للمودل خاطئة."}
+            return {"status": "fail", "message": "❌ بيانات المودل غير صحيحة."}
 
         cal_url = "https://moodle.alaqsa.edu.ps/calendar/view.php?view=upcoming"
         res = session.get(cal_url, timeout=20)
@@ -53,142 +58,157 @@ def run_moodle_engine(user, pwd):
             link_tag = e.find('a', href=True)
             link = link_tag['href'].lower() if link_tag else ""
             
-            # فلترة المنجزات
             if any(word in txt for word in ["تم التسليم", "محلول", "submitted", "تخطى", "سلمت"]):
                 continue
 
-            # كلمات دلالية للتكاليف (تشمل التجارب وطلبات الرفع)
-            assign_words = ["تكليف", "واجب", "نشاط", "مهمة", "تقرير", "تجربة", "سلم", "رفع", "ملف", 
-                            "assignment", "task", "experiment", "report", "upload", "submit", "pdf", "docx"]
-            # كلمات دلالية للاختبارات
-            exam_words = ["اختبار", "امتحان", "كويز", "نصفي", "نهائي", "quiz", "exam", "test"]
+            # تصنيف شامل (تجربة، رفع ملفات، كويزات، لقاءات)
+            assign_keywords = ["تكليف", "واجب", "نشاط", "مهمة", "تقرير", "تجربة", "سلم", "رفع", "ملف", "assignment", "task", "experiment", "report", "upload", "submit"]
+            exam_keywords = ["اختبار", "امتحان", "كويز", "quiz", "exam", "test"]
 
-            # منطق الفرز بالترتيب
-            if "quiz" in link or any(word in txt for word in exam_words):
+            if "quiz" in link or any(word in txt for word in exam_keywords):
                 exams.append(txt.capitalize())
-            elif any(x in link for x in ["bigbluebutton", "zoom", "meet"]) or "لقاء" in txt:
+            elif any(x in link for x in ["zoom", "meet", "bigbluebutton"]) or "لقاء" in txt:
                 meetings.append(txt.capitalize())
-            elif "assign" in link or any(word in txt for word in assign_words):
+            elif "assign" in link or any(word in txt for word in assign_keywords):
                 assignments.append(txt.capitalize())
             else:
                 lectures.append(txt.capitalize())
 
         if not (lectures or meetings or exams or assignments):
-            return {"status": "success", "message": "✅ لا يوجد مهام معلقة حالياً."}
+            return {"status": "success", "message": "✅ لا يوجد تحديثات جديدة حالياً."}
 
-        # صياغة التقرير عبر Groq مع درجة حرارة 0 لمنع التلاعب بالتصنيفات
         prompt = f"""
-        رتب هذا التقرير الأكاديمي للطالب. اتبع التقسيمات المعطاة لك بدقة ولا تغير تصنيف أي عنصر:
-        
-        📚 المحاضرات الجديدة: {lectures if lectures else 'لا يوجد حالياً'}
-        🎥 اللقاءات المباشرة: {meetings if meetings else 'لا يوجد حالياً'}
-        📝 الاختبارات والكويزات: {exams if exams else 'لا يوجد حالياً'}
-        ⚠️ التكاليف والتجارب والواجبات: {assignments if assignments else 'لا يوجد حالياً'}
-        
-        ملاحظة: حافظ على الترتيب واستخدم إيموجيات لكل قسم.
+        رتب هذا التقرير الأكاديمي. لا تغير التصنيفات:
+        📚 المحاضرات: {lectures if lectures else 'لا يوجد'}
+        🎥 اللقاءات: {meetings if meetings else 'لا يوجد'}
+        📝 الاختبارات: {exams if exams else 'لا يوجد'}
+        ⚠️ التكاليف والتجارب: {assignments if assignments else 'لا يوجد'}
         """
         
         completion = client.chat.completions.create(
             model="llama-3.1-8b-instant",
-            messages=[{"role": "system", "content": "أنت منسق بيانات أكاديمي محترف."},
-                      {"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.0
         )
         return {"status": "success", "message": completion.choices[0].message.content}
-    except Exception as e:
-        return {"status": "error", "message": f"⚠️ حدث خطأ أثناء الفحص: {str(e)}"}
+    except:
+        return {"status": "error", "message": "⚠️ المودل لا يستجيب."}
 
-# --- 4. الصلاحيات والإجازة ---
+# --- 4. فحص الاشتراك والصلاحية ---
 def check_access(chat_id):
-    if datetime.now() < FREE_TRIAL_END: return True, "تجريبي"
+    # 1. فحص الفترة التجريبية العامة
+    if datetime.now() < FREE_TRIAL_END:
+        return True, "تجريبي"
+    
     conn = get_db_connection()
-    res = conn.cursor().execute('SELECT expiry_date, is_vip FROM users WHERE chat_id=?', (chat_id,)).fetchone()
+    user_data = conn.cursor().execute('SELECT expiry_date, is_vip FROM users WHERE chat_id=?', (chat_id,)).fetchone()
     conn.close()
-    if res and (res[1] == 1 or (res[0] and datetime.strptime(res[0], '%Y-%m-%d %H:%M:%S') > datetime.now())):
-        return True, "مشترك"
+    
+    if user_data:
+        expiry_date_str, is_vip = user_data
+        # 2. فحص الـ VIP
+        if is_vip == 1:
+            return True, "VIP"
+        # 3. فحص تاريخ انتهاء الاشتراك العادي
+        if expiry_date_str:
+            expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%d %H:%M:%S')
+            if expiry_date > datetime.now():
+                return True, "مشترك"
+    
     return False, None
 
-@bot.message_handler(commands=['holiday'])
-def toggle_holiday(message):
-    global IS_HOLIDAY
-    if message.from_user.id != ADMIN_ID: return
-    IS_HOLIDAY = "on" in message.text
-    bot.reply_to(message, f"🏝️ وضع الإجازة: {'مفعل' if IS_HOLIDAY else 'معطل'}")
-
-# --- 5. الأوامر الأساسية واستلام البيانات ---
+# --- 5. أوامر البوت ---
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.reply_to(message, "🎓 **بوت مودل الأقصى المطور**\nجاهز لفحص محاضراتك وتجاربك وواجباتك بدقة.\nاستخدم /check للبدء.")
+    bot.send_message(message.chat.id, "🎓 **مرحباً بك في بوت مودل الأقصى المطور**\n\nيتم حفظ بياناتك تلقائياً لتقديم تقارير دورية كل 6 ساعات.\nاستخدم /check للفحص الآن.")
 
 @bot.message_handler(commands=['check'])
 def manual_check(message):
-    allowed, _ = check_access(message.chat.id)
+    allowed, status = check_access(message.chat.id)
     if not allowed:
-        bot.send_message(message.chat.id, "🚫 انتهى اشتراكك. للتجديد: /subscribe")
+        bot.send_message(message.chat.id, "🚫 اشتراكك منتهي. لتجديد الاشتراك: /subscribe")
         return
+
     conn = get_db_connection()
     u = conn.cursor().execute('SELECT username, password FROM users WHERE chat_id=?', (message.chat.id,)).fetchone()
     conn.close()
+
     if u:
-        bot.send_message(message.chat.id, "🔍 جاري الفحص والفرز الدقيق...")
+        bot.send_message(message.chat.id, f"🔍 جاري الفحص (حساب {status})...")
         res = run_moodle_engine(u[0], u[1])
         bot.send_message(message.chat.id, res["message"])
     else:
-        msg = bot.send_message(message.chat.id, "أرسل الرقم الجامعي:")
-        bot.register_next_step_handler(msg, lambda m: bot.register_next_step_handler(bot.send_message(m.chat.id, "أرسل كلمة المرور:"), lambda p: save_user(p, m.text)))
+        msg = bot.send_message(message.chat.id, "أرسل الرقم الجامعي للربط:")
+        bot.register_next_step_handler(msg, get_user_id)
 
-def save_user(message, user):
+def get_user_id(message):
+    user = message.text
+    msg = bot.send_message(message.chat.id, "أرسل كلمة مرور المودل:")
+    bot.register_next_step_handler(msg, lambda m: save_user_data(m, user))
+
+def save_user_data(message, user):
     pwd = message.text
+    bot.send_message(message.chat.id, "⏳ جاري التحقق والربط...")
     res = run_moodle_engine(user, pwd)
     if res["status"] == "success":
         conn = get_db_connection()
-        conn.cursor().execute('INSERT OR REPLACE INTO users (chat_id, username, password) VALUES (?,?,?)', (message.chat.id, user, pwd))
-        conn.commit(); conn.close()
-        bot.send_message(message.chat.id, "✅ تم الربط بنجاح! تقريرك الأول:\n\n" + res["message"])
+        # INSERT OR REPLACE تضمن تحديث البيانات لنفس المستخدم دون حذف القديم
+        conn.cursor().execute('INSERT OR REPLACE INTO users (chat_id, username, password) VALUES (?, ?, ?)', (message.chat.id, user, pwd))
+        conn.commit()
+        conn.close()
+        bot.send_message(message.chat.id, "✅ تم الربط بنجاح! سيصلك تقرير كل 6 ساعات.\n\n" + res["message"])
     else:
         bot.send_message(message.chat.id, res["message"])
 
-# --- 6. نظام الدفع والجدولة ---
 @bot.message_handler(commands=['subscribe'])
 def subscribe(message):
-    bot.send_message(message.chat.id, f"💳 **التفعيل (5 شيكل):**\nجوال باي: `0597599642`\nبينانس: `{BINANCE_PAY_ID}`\nارسل الإيصال هنا.")
+    bot.send_message(message.chat.id, f"💳 **تفعيل الاشتراك:**\nجوال باي: `0597599642`\nبينانس: `{BINANCE_PAY_ID}`\nارسل الإيصال هنا.")
 
 @bot.message_handler(content_types=['photo'])
-def handle_receipt(message):
+def handle_payment(message):
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✅ شهر", callback_data=f"act_{message.chat.id}_30"),
-               types.InlineKeyboardButton("🌟 VIP", callback_data=f"act_{message.chat.id}_VIP"))
+    markup.add(types.InlineKeyboardButton("✅ شهر", callback_data=f"pay_{message.chat.id}_30"),
+               types.InlineKeyboardButton("🌟 VIP", callback_data=f"pay_{message.chat.id}_VIP"))
     bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=f"📩 إيصال من: `{message.chat.id}`", reply_markup=markup)
-    bot.reply_to(message, "⏳ جارٍ التفعيل من قبل الإدارة...")
+    bot.reply_to(message, "⏳ استلمنا الإيصال، سيتم التفعيل قريباً.")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('act_'))
-def admin_confirm(call):
+@bot.callback_query_handler(func=lambda call: call.data.startswith('pay_'))
+def admin_pay(call):
     if call.from_user.id != ADMIN_ID: return
     _, uid, mode = call.data.split('_')
     conn = get_db_connection()
-    exp = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S') if mode != "VIP" else None
-    conn.cursor().execute('UPDATE users SET expiry_date=?, is_vip=? WHERE chat_id=?', (exp, 1 if mode=="VIP" else 0, uid))
+    if mode == "VIP":
+        conn.cursor().execute('UPDATE users SET is_vip=1 WHERE chat_id=?', (uid,))
+    else:
+        new_exp = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+        conn.cursor().execute('UPDATE users SET expiry_date=?, is_vip=0 WHERE chat_id=?', (new_exp, uid))
     conn.commit(); conn.close()
-    bot.send_message(uid, "🎉 تم تفعيل اشتراكك بنجاح! استمتع بخدمات البوت.")
-    bot.answer_callback_query(call.id, "تم التفعيل")
+    bot.send_message(uid, "🎉 تم تفعيل اشتراكك بنجاح!")
+    bot.answer_callback_query(call.id, "تم")
 
-def scheduler_loop():
-    schedule.every().day.at("08:00").do(daily_broadcast)
-    while True: schedule.run_pending(); time.sleep(60)
+# --- 6. التوقيت المجدول (كل 6 ساعات) ---
+def auto_reports():
+    # فحص دوري كل 6 ساعات
+    schedule.every(6).hours.do(broadcast_reports)
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
 
-def daily_broadcast():
+def broadcast_reports():
     if IS_HOLIDAY: return
     conn = get_db_connection()
     users = conn.cursor().execute('SELECT chat_id, username, password FROM users WHERE username IS NOT NULL').fetchall()
     conn.close()
+    
     for uid, user, pwd in users:
-        if check_access(uid)[0]:
+        allowed, _ = check_access(uid)
+        if allowed:
             res = run_moodle_engine(user, pwd)
             if res["status"] == "success":
-                try: bot.send_message(uid, f"🔔 **تقرير الصباح:**\n\n{res['message']}")
+                try: bot.send_message(uid, f"🔔 **تقرير المودل الدوري (كل 6 ساعات):**\n\n{res['message']}")
                 except: pass
 
 if __name__ == "__main__":
     init_db()
-    threading.Thread(target=scheduler_loop, daemon=True).start()
+    threading.Thread(target=auto_reports, daemon=True).start()
     bot.infinity_polling()
