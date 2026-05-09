@@ -6,7 +6,7 @@ from telebot import types
 
 # --- 1. الإعدادات الأساسية ---
 TOKEN = os.getenv("TOKEN")
-GROQ_KEY = os.getenv("GROQ_KEY")
+GROQ_KEY = os.getenv("GROQ-KEY")
 ADMIN_ID = 7840931571  
 BINANCE_PAY_ID = "983969145"
 FREE_TRIAL_END = datetime(2026, 6, 1) # فترة تجريبية مجانية للجميع
