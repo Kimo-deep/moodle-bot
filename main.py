@@ -89,7 +89,7 @@ def activate_subscription(chat_id, plan):
 # ─────────────────────────────────────────────
 DONE_KEYWORDS = [
     "تم التسليم", "submitted", "تخطى", "سلمت", "تم الإرسال", "finished",
-    "completed", "مكتمل", "تم الحل", "answered", "graded", "تم التقييم",
+    "completed", "مكتمل", "تم الحل", "answered", "graded", "تم التقييم"," مسلمة" , 
     "درجتك", "your grade", "attempt already", "تم المحاولة",
     "no attempts allowed", "past due",
 ]
