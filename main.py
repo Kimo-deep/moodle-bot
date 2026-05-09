@@ -69,16 +69,8 @@ def init_db():
                 created_at TEXT    NOT NULL,
                 status     TEXT    NOT NULL DEFAULT 'pending'
             );
-            CREATE TABLE IF NOT EXISTS feedback (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id    INTEGER NOT NULL,
-                username   TEXT,
-                message    TEXT    NOT NULL,
-                sent_at    TEXT    NOT NULL,
-                status     TEXT    NOT NULL DEFAULT 'new'
-            );
+            
             CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
-            CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback(status);
         """)
 
 # ══════════════════════════════════════════════════════
