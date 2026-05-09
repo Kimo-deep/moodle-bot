@@ -1,708 +1,797 @@
-import os, telebot, requests, sqlite3, threading, schedule, time, hashlib, hmac, json, uuid
+"""
+بوت مودل الأقصى — النسخة المُصحَّحة والمُحسَّنة
+=================================================
+متغيرات البيئة المطلوبة:
+  TOKEN              — Telegram Bot Token
+  GROQ-KEY           — Groq API Key
+  BINANCE_API_KEY    — Binance Pay Certificate SN  (اختياري)
+  BINANCE_SECRET_KEY — Binance Pay Secret Key      (اختياري)
+"""
+
+import os, hmac, hashlib, json, uuid, time, threading, sqlite3, schedule, requests, logging
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from groq import Groq
-from datetime import datetime, timedelta
+import telebot
 from telebot import types
 
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════
 # 1. الإعدادات
-# ─────────────────────────────────────────────
-TOKEN            = os.getenv("TOKEN")
-GROQ_KEY         = os.getenv("GROQ-KEY")
-BINANCE_API_KEY  = os.getenv("BINANCE_API_KEY")
-BINANCE_SECRET   = os.getenv("BINANCE_SECRET_KEY")
-ADMIN_ID         = 7840931571
-FREE_TRIAL_END   = datetime(2026, 6, 1)
-PRICE_MONTHLY    = 2.0   # دولار USDT
+# ══════════════════════════════════════════════════════
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
 
-bot    = telebot.TeleBot(TOKEN)
+TOKEN      = os.getenv("TOKEN")
+GROQ_KEY   = os.getenv("GROQ-KEY")
+BIN_CERT   = os.getenv("BINANCE_API_KEY")
+BIN_SECRET = os.getenv("BINANCE_SECRET_KEY")
+
+ADMIN_ID       = 7840931571
+FREE_TRIAL_END = datetime(2026, 6, 1)
+PRICE_USD      = 2.0
+ILS_PER_USD    = 3.7          # يُحدَّث تلقائياً
+DB_PATH        = "/app/data/users.db"
+
+bot    = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 client = Groq(api_key=GROQ_KEY)
 IS_HOLIDAY = False
 
-# ─────────────────────────────────────────────
-# 2. قاعدة البيانات
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════
+# 2. قاعدة البيانات — context manager يضمن إغلاق الاتصال دائماً
+# ══════════════════════════════════════════════════════
+@contextmanager
+def get_db():
+    """يفتح الاتصال ويغلقه تلقائياً حتى عند الأخطاء."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=20)
+    conn.row_factory = sqlite3.Row   # الوصول بالاسم: row["chat_id"]
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 def init_db():
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-                    chat_id      INTEGER PRIMARY KEY,
-                    username     TEXT,
-                    password     TEXT,
-                    expiry_date  TEXT,
-                    is_vip       INTEGER DEFAULT 0,
-                    last_hash    TEXT,
-                    last_report  TEXT
-                 )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS pending_payments (
-                    order_id   TEXT PRIMARY KEY,
-                    chat_id    INTEGER,
-                    amount     REAL,
-                    created_at TEXT,
-                    status     TEXT DEFAULT "pending"
-                 )''')
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id     INTEGER PRIMARY KEY,
+                username    TEXT,
+                password    TEXT,
+                expiry_date TEXT,
+                is_vip      INTEGER DEFAULT 0,
+                last_hash   TEXT,
+                last_report TEXT
+            );
+            CREATE TABLE IF NOT EXISTS payments (
+                order_id   TEXT    PRIMARY KEY,
+                chat_id    INTEGER NOT NULL,
+                created_at TEXT    NOT NULL,
+                status     TEXT    NOT NULL DEFAULT 'pending'
+            );
+            -- فهرس لتسريع استعلام poll_payments
+            CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
+        """)
 
-def get_db_connection():
-    return sqlite3.connect('/app/data/users.db', check_same_thread=False, timeout=20)
+# ══════════════════════════════════════════════════════
+# 3. سعر الصرف
+# ══════════════════════════════════════════════════════
+def refresh_rate():
+    global ILS_PER_USD
+    try:
+        r = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=8).json()
+        ILS_PER_USD = round(r["rates"]["ILS"], 2)
+        log.info(f"سعر الصرف محدَّث: 1$ = {ILS_PER_USD} ₪")
+    except Exception as e:
+        log.warning(f"فشل تحديث سعر الصرف: {e}")
 
-# ─────────────────────────────────────────────
-# 3. فحص الاشتراك
-# ─────────────────────────────────────────────
-def check_access(chat_id):
+def price_str():
+    return f"{PRICE_USD}$ USDT (≈ {round(PRICE_USD * ILS_PER_USD, 1)} ₪)"
+
+# ══════════════════════════════════════════════════════
+# 4. الاشتراك
+# ══════════════════════════════════════════════════════
+def check_access(chat_id: int) -> tuple[bool, str | None]:
     if datetime.now() < FREE_TRIAL_END:
         return True, "تجريبي"
-    conn = get_db_connection()
-    row = conn.cursor().execute(
-        'SELECT expiry_date, is_vip FROM users WHERE chat_id=?', (chat_id,)
-    ).fetchone()
-    conn.close()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT expiry_date, is_vip FROM users WHERE chat_id=?", (chat_id,)
+        ).fetchone()
     if row:
-        expiry_str, is_vip = row
-        if is_vip == 1:
+        if row["is_vip"]:
             return True, "VIP"
-        if expiry_str:
-            exp = datetime.strptime(expiry_str, '%Y-%m-%d %H:%M:%S')
+        if row["expiry_date"]:
+            exp = datetime.strptime(row["expiry_date"], "%Y-%m-%d %H:%M:%S")
             if exp > datetime.now():
-                days = (exp - datetime.now()).days
-                return True, f"مشترك ({days} يوم)"
+                return True, f"مشترك ({(exp - datetime.now()).days} يوم)"
     return False, None
 
-# ─────────────────────────────────────────────
-# 4. تفعيل الاشتراك
-# ─────────────────────────────────────────────
-def activate_subscription(chat_id, plan):
-    conn = get_db_connection()
-    if plan == "VIP":
-        conn.cursor().execute('UPDATE users SET is_vip=1 WHERE chat_id=?', (chat_id,))
-    else:
-        exp = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
-        conn.cursor().execute(
-            'UPDATE users SET expiry_date=?, is_vip=0 WHERE chat_id=?', (exp, chat_id)
-        )
-    conn.commit()
-    conn.close()
+def activate(chat_id: int, plan: str):
+    """plan = 'monthly' | 'VIP'"""
+    with get_db() as conn:
+        conn.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
+        if plan == "VIP":
+            conn.execute("UPDATE users SET is_vip=1 WHERE chat_id=?", (chat_id,))
+        else:
+            exp = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                "UPDATE users SET expiry_date=?, is_vip=0 WHERE chat_id=?", (exp, chat_id)
+            )
 
-# ─────────────────────────────────────────────
-# 5. فلترة المنجز
-# ─────────────────────────────────────────────
-DONE_KEYWORDS = [
-    "تم التسليم", "submitted", "تخطى", "سلمت", "تم الإرسال", "finished",
-    "completed", "مكتمل", "تم الحل", "answered", "graded", "تم التقييم"," مسلمة" , 
-    "درجتك", "your grade", "attempt already", "تم المحاولة",
-    "no attempts allowed", "past due",
+# ══════════════════════════════════════════════════════
+# 5. كشف المنجز — 3 خطوط دفاع
+# ══════════════════════════════════════════════════════
+_CAL_DONE_KW = [
+    "تم التسليم", "submitted", "تخطى", "سلمت", "تم الإرسال",
+    "attempt already", "تم المحاولة", "no attempts allowed",
+    "past due", "overdue",
 ]
 
-def is_done(text):
+def _quick_done(text: str) -> bool:
+    """خط 1: فحص سريع بالكلمات المفتاحية من نص التقويم."""
     t = text.lower()
-    return any(k.lower() in t for k in DONE_KEYWORDS)
+    return any(k.lower() in t for k in _CAL_DONE_KW)
 
-# ─────────────────────────────────────────────
-# 6. محرك المودل
-# ─────────────────────────────────────────────
-def run_moodle_engine(user, pwd):
-    session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0'})
-    login_url = "https://moodle.alaqsa.edu.ps/login/index.php"
+def _assign_done(session: requests.Session, url: str) -> bool:
+    """
+    خط 2: يفحص صفحة التكليف مباشرة.
+    True  = سُلِّم → أخفِه
+    False = لم يُسلَّم أو فشل الطلب → أبقه
+    """
     try:
-        r     = session.get(login_url, timeout=20)
-        token = BeautifulSoup(r.text, 'html.parser').find('input', {'name': 'logintoken'})['value']
-        lr    = session.post(login_url,
-                             data={'username': user, 'password': pwd, 'logintoken': token},
+        soup = BeautifulSoup(session.get(url, timeout=12).text, "html.parser")
+        # جدول حالة التسليم الرسمي في مودل
+        for row in soup.find_all("tr"):
+            th = row.find("th")
+            td = row.find("td")
+            if not (th and td):
+                continue
+            label = th.get_text(strip=True).lower()
+            value = td.get_text(strip=True).lower()
+            if not any(k in label for k in ["حالة التسليم", "submission status", "status"]):
+                continue
+            # "لم يُسلَّم" → لم يسلم
+            if any(k in value for k in ["لم يُسلَّم", "no submission", "not submitted", "لم يتم"]):
+                return False
+            return True   # أي حالة أخرى = سُلِّم
+        # زر تعديل التسليم = سلّم مسبقاً
+        page = soup.get_text(" ", strip=True).lower()
+        return any(k in page for k in [
+            "تعديل التسليم", "edit submission",
+            "you have submitted", "already submitted",
+        ])
+    except Exception:
+        return False   # فشل الطلب → أبقه ظاهراً (الأأمن)
+
+def _quiz_done(session: requests.Session, url: str) -> bool:
+    """
+    خط 3: يفحص صفحة الكويز مباشرة.
+    True  = حُلَّ أو لا محاولات → أخفِه
+    False = لم يُحَل → أبقه
+    """
+    try:
+        soup = BeautifulSoup(session.get(url, timeout=12).text, "html.parser")
+        page = soup.get_text(" ", strip=True).lower()
+        if any(k in page for k in [
+            "لقد أنهيت", "your last attempt", "آخر محاولة",
+            "no more attempts", "لا محاولات متبقية",
+            "مراجعة المحاولة", "review attempt",
+            "your grade", "درجتك", "grade:",
+            "attempt 1", "المحاولة 1",
+        ]):
+            return True
+        # جدول المحاولات السابقة
+        return bool(soup.find("table", {"class": lambda x: x and "quizattemptsummary" in x}))
+    except Exception:
+        return False
+
+# ══════════════════════════════════════════════════════
+# 6. محرك المودل
+# ══════════════════════════════════════════════════════
+_EXAM_KW   = ["اختبار", "امتحان", "كويز", "quiz", "exam", "test", "midterm"]
+_ASSIGN_KW = ["تكليف", "واجب", "مهمة", "تقرير", "تجربة", "رفع", "ملف",
+              "assignment", "task", "experiment", "report", "upload", "submit"]
+_MEET_KW   = ["zoom", "meet", "bigbluebutton"]
+
+def run_moodle(username: str, password: str) -> dict:
+    session = requests.Session()
+    session.headers["User-Agent"] = "Mozilla/5.0"
+    login_url = "https://moodle.alaqsa.edu.ps/login/index.php"
+
+    try:
+        # ── تسجيل الدخول ──────────────────────────────
+        soup  = BeautifulSoup(session.get(login_url, timeout=20).text, "html.parser")
+        token_input = soup.find("input", {"name": "logintoken"})
+        if not token_input:
+            return {"status": "error", "message": "⚠️ تعذّر الوصول إلى صفحة تسجيل الدخول."}
+        token = token_input["value"]
+        resp  = session.post(login_url,
+                             data={"username": username, "password": password, "logintoken": token},
                              timeout=20)
-        if "login" in lr.url:
+        if "login" in resp.url:
             return {"status": "fail", "message": "❌ بيانات المودل غير صحيحة."}
 
-        soup   = BeautifulSoup(
-            session.get("https://moodle.alaqsa.edu.ps/calendar/view.php?view=upcoming", timeout=20).text,
-            'html.parser'
-        )
-        events = soup.find_all('div', {'class': 'event'})
+        # ── صفحة التقويم ──────────────────────────────
+        cal_html = session.get(
+            "https://moodle.alaqsa.edu.ps/calendar/view.php?view=upcoming", timeout=20
+        ).text
+        soup = BeautifulSoup(cal_html, "html.parser")
 
         lectures, meetings, exams, assignments = [], [], [], []
         skipped = 0
 
-        for e in events:
-            txt     = e.get_text(separator=' ', strip=True)
-            txt_low = txt.lower()
-            link_tag = e.find('a', href=True)
-            link     = link_tag['href'].lower() if link_tag else ""
+        for ev in soup.find_all("div", {"class": "event"}):
+            txt  = ev.get_text(" ", strip=True)
+            tl   = txt.lower()
+            atag = ev.find("a", href=True)
+            link = atag["href"] if atag else ""
+            ll   = link.lower()
 
-            if is_done(txt):
+            # خط 1: كلمات سريعة
+            if _quick_done(txt):
                 skipped += 1
                 continue
 
-            expired = False
-            for tt in e.find_all(['time', 'span'], {'class': lambda x: x and 'date' in x}):
-                ds = tt.get('datetime', '')
-                if ds:
-                    try:
-                        et = datetime.fromisoformat(ds.replace('Z', '+00:00')).replace(tzinfo=None)
-                        if et < datetime.now() - timedelta(hours=1):
-                            skipped += 1
-                            expired = True
-                            break
-                    except:
-                        pass
-            if expired:
-                continue
+            is_quiz   = "quiz"   in ll or any(w in tl for w in _EXAM_KW)
+            is_assign = "assign" in ll or any(w in tl for w in _ASSIGN_KW)
+            is_meet   = any(x in ll for x in _MEET_KW) or "لقاء" in txt
 
-            exam_kw   = ["اختبار", "امتحان", "كويز", "quiz", "exam", "test", "midterm"]
-            assign_kw = ["تكليف", "واجب", "مهمة", "تقرير", "تجربة", "رفع", "ملف",
-                         "assignment", "task", "experiment", "report", "upload", "submit"]
+            # خط 2 و 3: فحص الصفحة الفعلية
+            if link:
+                if is_assign and not is_quiz:
+                    if _assign_done(session, link):
+                        skipped += 1
+                        continue
+                elif is_quiz:
+                    if _quiz_done(session, link):
+                        skipped += 1
+                        continue
 
-            if "quiz" in link or any(w in txt_low for w in exam_kw):
-                exams.append(txt)
-            elif any(x in link for x in ["zoom", "meet", "bigbluebutton"]) or "لقاء" in txt:
-                meetings.append(txt)
-            elif "assign" in link or any(w in txt_low for w in assign_kw):
-                assignments.append(txt)
-            else:
-                lectures.append(txt)
+            if is_quiz:        exams.append(txt)
+            elif is_meet:      meetings.append(txt)
+            elif is_assign:    assignments.append(txt)
+            else:              lectures.append(txt)
 
         if not any([lectures, meetings, exams, assignments]):
             note = f"\n_(مخفي: {skipped} منجز)_" if skipped else ""
             return {"status": "success", "message": f"✅ لا يوجد تحديثات جديدة حالياً.{note}"}
 
-        hidden_note = f"\n\n_(مخفي: {skipped} منجز)_" if skipped else ""
+        hidden = f"\n\n_(تم إخفاء {skipped} عنصر منجز)_" if skipped else ""
 
-        prompt = f"""أنت مساعد أكاديمي. نسّق البيانات التالية بالضبط وفق القواعد:
-
-=== القواعد الصارمة ===
-1. احذف كل نص يحتوي على: "حدث المساق", "إذهب إلى النشاط", "إضافة تسليم", "يرجى الالتزام", "التسليم فقط", "ولن يتم", "WhatsApp", "واتساب", "PDF", "Moodle", أو أي تعليمات تسليم.
-2. شكل كل عنصر حرفياً هكذا:
-
-▪️ [اسم الاختبار أو التكليف]
-   📌 المادة: [اسم المادة]
-   👨‍🏫 الدكتور: [الاسم فقط بدون لقب]
-   🕐 يفتح: [اليوم التاريخ الوقت] | يغلق: [اليوم التاريخ الوقت]   ← للاختبارات فقط
-   📅 آخر موعد: [اليوم التاريخ الوقت]                              ← للتكاليف فقط
-
-3. سطر فارغ بين كل عنصر.
-4. لا تكتب مقدمة ولا خاتمة ولا شرحاً.
-5. إذا القسم فارغ: اكتب "لا يوجد" بجانب عنوانه مباشرة.
-6. إذا لم يُذكر الدكتور: اكتب "غير محدد".
-
-=== البيانات ===
-
-📚 المحاضرات:
-{chr(10).join(lectures) if lectures else 'لا يوجد'}
-
-🎥 اللقاءات:
-{chr(10).join(meetings) if meetings else 'لا يوجد'}
-
-📝 الاختبارات:
-{chr(10).join(exams) if exams else 'لا يوجد'}
-
-⚠️ التكاليف والتجارب:
-{chr(10).join(assignments) if assignments else 'لا يوجد'}
-
-=== التقرير ==="""
+        prompt = (
+            "أنت مساعد أكاديمي. نسّق البيانات التالية وفق القواعد الصارمة:\n\n"
+            "=== القواعد ===\n"
+            "1. احذف كل نص يحتوي على: حدث المساق، إذهب إلى النشاط، إضافة تسليم،\n"
+            "   يرجى الالتزام، التسليم فقط، ولن يتم، WhatsApp، واتساب، PDF، Moodle،\n"
+            "   أو أي تعليمات تسليم أو ملاحظات إدارية.\n"
+            "2. شكل كل عنصر هكذا حرفياً:\n\n"
+            "▪️ [اسم الاختبار أو التكليف أو التجربة]\n"
+            "   📌 المادة: [اسم المادة]\n"
+            "   👨‍🏫 الدكتور: [الاسم فقط بلا لقب]\n"
+            "   🕐 يفتح: [يوم، تاريخ، وقت] | يغلق: [يوم، تاريخ، وقت]   ← للاختبارات\n"
+            "   📅 آخر موعد: [يوم، تاريخ، وقت]                           ← للتكاليف\n\n"
+            "3. سطر فارغ بين كل عنصر.\n"
+            "4. لا مقدمة ولا خاتمة ولا شرح.\n"
+            "5. إذا القسم فارغ: اكتب 'لا يوجد' بجانب عنوانه مباشرة.\n"
+            "6. إذا لم يُذكر الدكتور: اكتب 'غير محدد'.\n\n"
+            "=== البيانات ===\n\n"
+            f"📚 المحاضرات:\n{chr(10).join(lectures) if lectures else 'لا يوجد'}\n\n"
+            f"🎥 اللقاءات:\n{chr(10).join(meetings) if meetings else 'لا يوجد'}\n\n"
+            f"📝 الاختبارات:\n{chr(10).join(exams) if exams else 'لا يوجد'}\n\n"
+            f"⚠️ التكاليف والتجارب:\n{chr(10).join(assignments) if assignments else 'لا يوجد'}\n\n"
+            "=== التقرير المنسق ==="
+        )
 
         resp = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=1500
+            max_tokens=1500,
         )
-        return {"status": "success", "message": resp.choices[0].message.content + hidden_note}
+        return {"status": "success", "message": resp.choices[0].message.content + hidden}
 
-    except Exception as ex:
-        return {"status": "error", "message": f"⚠️ المودل لا يستجيب. ({str(ex)[:60]})"}
+    except requests.RequestException as e:
+        log.error(f"خطأ شبكة run_moodle: {e}")
+        return {"status": "error", "message": "⚠️ المودل لا يستجيب، حاول لاحقاً."}
+    except Exception as e:
+        log.error(f"خطأ run_moodle: {e}")
+        return {"status": "error", "message": f"⚠️ خطأ غير متوقع: {str(e)[:60]}"}
 
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════
 # 7. Binance Pay
-# ─────────────────────────────────────────────
-def _binance_headers(body_str):
-    nonce     = uuid.uuid4().hex
-    ts        = str(int(time.time() * 1000))
-    payload   = f"{ts}\n{nonce}\n{body_str}\n"
-    signature = hmac.new(BINANCE_SECRET.encode(), payload.encode(), hashlib.sha512).hexdigest().upper()
+# ══════════════════════════════════════════════════════
+def _bin_headers(body: str) -> dict:
+    """
+    يولّد headers التوقيع لـ Binance Pay API.
+    الصيغة الرسمية: TIMESTAMP\nNONCE\nBODY\n
+    """
+    nonce = uuid.uuid4().hex
+    ts    = str(int(time.time() * 1000))
+    raw   = f"{ts}\n{nonce}\n{body}\n"
+    sig   = hmac.new(                     # hmac.new(key, msg, digestmod)
+                BIN_SECRET.encode(),
+                raw.encode(),
+                hashlib.sha512
+            ).hexdigest().upper()
     return {
-        "Content-Type": "application/json",
-        "BinancePay-Timestamp": ts,
-        "BinancePay-Nonce": nonce,
-        "BinancePay-Certificate-SN": BINANCE_API_KEY,
-        "BinancePay-Signature": signature,
+        "Content-Type":              "application/json",
+        "BinancePay-Timestamp":      ts,
+        "BinancePay-Nonce":          nonce,
+        "BinancePay-Certificate-SN": BIN_CERT,
+        "BinancePay-Signature":      sig,
     }
 
-def create_binance_order(chat_id):
-    if not (BINANCE_API_KEY and BINANCE_SECRET):
-        return None, "Binance API غير مفعّل"
-    order_id = f"MOODLE_{chat_id}_{int(time.time())}"
+def binance_create(chat_id: int) -> tuple[str | None, str]:
+    """يرجع (checkout_url, order_id) أو (None, رسالة_خطأ)."""
+    if not (BIN_CERT and BIN_SECRET):
+        return None, "Binance Pay غير مفعّل."
+    order_id = f"MDB_{chat_id}_{int(time.time())}"   # أقصر من MOODLE_
     body = json.dumps({
-        "env": {"terminalType": "APP"},
+        "env":             {"terminalType": "WEB"},
         "merchantTradeNo": order_id,
-        "orderAmount": PRICE_MONTHLY,
-        "currency": "USDT",
-        "description": "Moodle Bot - شهر",
-        "goodsDetails": [{"goodsType": "02", "goodsCategory": "Z000",
-                          "referenceGoodsId": "monthly", "goodsName": "Moodle Bot",
-                          "goodsUnitAmount": {"currency": "USDT", "amount": str(PRICE_MONTHLY)}}]
-    }, separators=(',', ':'))
+        "orderAmount":     f"{PRICE_USD:.2f}",    # "2.00" — Binance تتوقع string بخانتين
+        "currency":        "USDT",
+        "description":     "Moodle Bot Monthly",
+        "goodsDetails": [{
+            "goodsType":        "02",
+            "goodsCategory":    "Z000",
+            "referenceGoodsId": "monthly",
+            "goodsName":        "Moodle Bot Subscription",
+            "goodsUnitAmount":  {"currency": "USDT", "amount": f"{PRICE_USD:.2f}"},
+        }],
+    }, separators=(",", ":"))
     try:
-        r = requests.post("https://bpay.binanceapi.com/binancepay/openapi/v2/order",
-                          headers=_binance_headers(body), data=body, timeout=15).json()
+        r = requests.post(
+            "https://bpay.binanceapi.com/binancepay/openapi/v2/order",
+            headers=_bin_headers(body), data=body, timeout=15
+        ).json()
         if r.get("status") == "SUCCESS":
-            conn = get_db_connection()
-            conn.cursor().execute(
-                'INSERT INTO pending_payments VALUES (?,?,?,?,?)',
-                (order_id, chat_id, PRICE_MONTHLY, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "pending")
-            )
-            conn.commit(); conn.close()
+            with get_db() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO payments VALUES (?,?,?,?)",
+                    (order_id, chat_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "pending")
+                )
             return r["data"]["checkoutUrl"], order_id
-        return None, r.get("errorMessage", "خطأ غير معروف")
-    except Exception as ex:
-        return None, str(ex)[:60]
+        err = r.get("errorMessage", "خطأ غير معروف")
+        log.warning(f"Binance create failed: {err}")
+        return None, f"Binance: {err}"
+    except Exception as e:
+        log.error(f"Binance create exception: {e}")
+        return None, str(e)[:60]
 
-def check_binance_order(order_id):
-    if not (BINANCE_API_KEY and BINANCE_SECRET):
+def binance_query(order_id: str) -> str | None:
+    """يرجع 'PAID' | 'UNPAID' | 'CANCELLED' | 'EXPIRED' | None."""
+    if not (BIN_CERT and BIN_SECRET):
         return None
-    body = json.dumps({"merchantTradeNo": order_id}, separators=(',', ':'))
+    body = json.dumps({"merchantTradeNo": order_id}, separators=(",", ":"))
     try:
-        r = requests.post("https://bpay.binanceapi.com/binancepay/openapi/v1/order/query",
-                          headers=_binance_headers(body), data=body, timeout=10).json()
+        r = requests.post(
+            "https://bpay.binanceapi.com/binancepay/openapi/v1/order/query",
+            headers=_bin_headers(body), data=body, timeout=10
+        ).json()
         if r.get("status") == "SUCCESS":
             return r["data"]["status"]
-    except:
-        pass
+    except Exception as e:
+        log.warning(f"Binance query exception: {e}")
     return None
 
-def poll_pending_payments():
-    conn = get_db_connection()
-    rows = conn.cursor().execute(
-        "SELECT order_id, chat_id FROM pending_payments WHERE status='pending'"
-    ).fetchall()
-    conn.close()
-    for order_id, chat_id in rows:
-        status = check_binance_order(order_id)
-        if status == "PAID":
-            activate_subscription(chat_id, "monthly")
-            conn = get_db_connection()
-            conn.cursor().execute("UPDATE pending_payments SET status='paid' WHERE order_id=?", (order_id,))
-            conn.commit(); conn.close()
+def poll_payments():
+    """يتحقق من الطلبات المعلقة — يُهمل الطلبات الأقدم من 24 ساعة تلقائياً."""
+    cutoff = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT order_id, chat_id FROM payments WHERE status='pending' AND created_at >= ?",
+            (cutoff,)
+        ).fetchall()
+        # تنظيف تلقائي: احذف الطلبات المعلقة الأقدم من 24 ساعة لتوفير المساحة
+        conn.execute(
+            "DELETE FROM payments WHERE status='pending' AND created_at < ?", (cutoff,)
+        )
+
+    for row in rows:
+        order_id, chat_id = row["order_id"], row["chat_id"]
+        st = binance_query(order_id)
+        if st == "PAID":
+            activate(chat_id, "monthly")
+            with get_db() as conn:
+                conn.execute("UPDATE payments SET status='paid' WHERE order_id=?", (order_id,))
             try:
-                bot.send_message(chat_id, "🎉 تم استلام دفعتك وتفعيل اشتراكك تلقائياً!")
-            except:
+                bot.send_message(chat_id, "🎉 تم استلام دفعتك وتفعيل اشتراكك تلقائياً\\!")
+            except Exception:
                 pass
-        elif status == "CANCELLED":
-            conn = get_db_connection()
-            conn.cursor().execute("UPDATE pending_payments SET status='cancelled' WHERE order_id=?", (order_id,))
-            conn.commit(); conn.close()
+        elif st in ("CANCELLED", "EXPIRED"):
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE payments SET status=? WHERE order_id=?", (st.lower(), order_id)
+                )
 
-# ─────────────────────────────────────────────
-# 8. /start
-# ─────────────────────────────────────────────
-@bot.message_handler(commands=['start'])
-def cmd_start(message):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("🔍 فحص الآن", "📊 حالتي")
-    markup.row("💳 اشتراك",   "❓ مساعدة")
-    bot.send_message(
-        message.chat.id,
+# ══════════════════════════════════════════════════════
+# 8. أوامر البوت
+# ══════════════════════════════════════════════════════
+
+# ── /start ──────────────────────────────────────────
+@bot.message_handler(commands=["start"])
+def cmd_start(m):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("🔍 فحص الآن", "📊 حالتي")
+    kb.row("💳 اشتراك",   "❓ مساعدة")
+    bot.send_message(m.chat.id,
         "🎓 *مرحباً في بوت مودل الأقصى*\n\n"
-        "• يفحص المودل كل 6 ساعات تلقائياً\n"
-        "• يُخفي التكاليف المسلّمة والامتحانات المنتهية\n"
-        "• لا يُرسل إذا لم يكن هناك جديد\n\n"
-        "استخدم /check للفحص الآن.",
-        parse_mode="Markdown",
-        reply_markup=markup
-    )
+        "• فحص تلقائي كل 6 ساعات\n"
+        "• يُخفي التكاليف المسلّمة والكويزات المحلولة\n"
+        "• لا يُرسل إذا لا يوجد جديد",
+        reply_markup=kb)
 
-# ─────────────────────────────────────────────
-# 9. فحص الآن
-# ─────────────────────────────────────────────
-def _do_check(chat_id):
-    allowed, status = check_access(chat_id)
-    if not allowed:
-        bot.send_message(chat_id, "🚫 اشتراكك منتهي. استخدم /subscribe للتجديد.")
+# ── /check + زر ─────────────────────────────────────
+def _do_check(chat_id: int):
+    ok, label = check_access(chat_id)
+    if not ok:
+        bot.send_message(chat_id, "🚫 اشتراكك منتهٍ\\. استخدم /subscribe للتجديد\\.")
         return
-    conn = get_db_connection()
-    u = conn.cursor().execute('SELECT username, password FROM users WHERE chat_id=?', (chat_id,)).fetchone()
-    conn.close()
-    if u and u[0]:
-        m   = bot.send_message(chat_id, f"🔍 جاري الفحص ({status})...")
-        res = run_moodle_engine(u[0], u[1])
-        bot.edit_message_text(res["message"], chat_id, m.message_id)
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT username, password FROM users WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+    if row and row["username"]:
+        wm  = bot.send_message(chat_id, f"🔍 جاري الفحص \\({label}\\)\\.\\.\\.")
+        res = run_moodle(row["username"], row["password"])
+        try:
+            bot.edit_message_text(res["message"], chat_id, wm.message_id)
+        except Exception:
+            bot.send_message(chat_id, res["message"])
     else:
-        m = bot.send_message(chat_id, "📋 أرسل رقمك الجامعي للربط:")
-        bot.register_next_step_handler(m, _step_get_user)
+        wm = bot.send_message(chat_id, "📋 أرسل رقمك الجامعي:")
+        bot.register_next_step_handler(wm, _step_user)
 
-@bot.message_handler(commands=['check'])
-def cmd_check(message):
-    _do_check(message.chat.id)
+@bot.message_handler(commands=["check"])
+def cmd_check(m): _do_check(m.chat.id)
 
 @bot.message_handler(func=lambda m: m.text == "🔍 فحص الآن")
-def btn_check(message):
-    _do_check(message.chat.id)
+def btn_check(m): _do_check(m.chat.id)
 
-# ─────────────────────────────────────────────
-# 10. حالتي
-# ─────────────────────────────────────────────
-def _do_status(chat_id):
-    allowed, status = check_access(chat_id)
-    conn = get_db_connection()
-    u = conn.cursor().execute('SELECT username, last_report FROM users WHERE chat_id=?', (chat_id,)).fetchone()
-    conn.close()
+# ── /status + زر ────────────────────────────────────
+def _do_status(chat_id: int):
+    ok, label = check_access(chat_id)
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT username, last_report FROM users WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+    linked = f"✅ مرتبط برقم `{row['username']}`" if row and row["username"] else "❌ غير مرتبط — /check"
+    last   = f"\n📅 آخر تقرير: {row['last_report']}" if row and row["last_report"] else "\n📅 لم يُرسل بعد"
+    sub    = f"✅ {label}" if ok else "❌ منتهٍ — /subscribe"
+    trial  = (f"\n⏳ التجربة تنتهي: {FREE_TRIAL_END:%Y\\-%-m\\-%-d}"
+              if datetime.now() < FREE_TRIAL_END else "")
+    bot.send_message(chat_id, f"👤 *حالة حسابك:*\n\n🔗 {linked}\n🎫 {sub}{trial}{last}")
 
-    linked     = f"✅ مرتبط برقم `{u[0]}`" if u and u[0] else "❌ غير مرتبط — استخدم /check"
-    last_rep   = f"\n📅 آخر تقرير: {u[1]}"  if u and u[1] else "\n📅 لم يُرسل تقرير بعد"
-    sub_stat   = f"✅ {status}"              if allowed    else "❌ منتهي — /subscribe"
-    trial_note = (f"\n⏳ تنتهي التجربة: {FREE_TRIAL_END.strftime('%Y-%m-%d')}"
-                  if datetime.now() < FREE_TRIAL_END else "")
-
-    bot.send_message(
-        chat_id,
-        f"👤 *حالة حسابك:*\n\n"
-        f"🔗 الربط: {linked}\n"
-        f"🎫 الاشتراك: {sub_stat}{trial_note}{last_rep}",
-        parse_mode="Markdown"
-    )
-
-@bot.message_handler(commands=['status'])
-def cmd_status(message):
-    _do_status(message.chat.id)
+@bot.message_handler(commands=["status"])
+def cmd_status(m): _do_status(m.chat.id)
 
 @bot.message_handler(func=lambda m: m.text == "📊 حالتي")
-def btn_status(message):
-    _do_status(message.chat.id)
+def btn_status(m): _do_status(m.chat.id)
 
-# ─────────────────────────────────────────────
-# 11. اشتراك
-# ─────────────────────────────────────────────
-def _do_subscribe(chat_id):
-    markup = types.InlineKeyboardMarkup()
-    if BINANCE_API_KEY and BINANCE_SECRET:
-        markup.add(types.InlineKeyboardButton(
-            f"💳 ادفع عبر Binance Pay ({PRICE_MONTHLY}$)", callback_data="sub_binance"
-        ))
-    markup.add(types.InlineKeyboardButton("📷 إرسال إيصال يدوي", callback_data="sub_manual"))
-    bot.send_message(
-        chat_id,
-        f"💳 *تفعيل الاشتراك الشهري:*\n\n"
-        f"💵 السعر: {PRICE_MONTHLY}$ USDT / شهر\n\n"
+# ── /subscribe + زر ─────────────────────────────────
+def _do_subscribe(chat_id: int):
+    kb = types.InlineKeyboardMarkup()
+    if BIN_CERT and BIN_SECRET:
+        kb.add(types.InlineKeyboardButton("💳 ادفع عبر Binance Pay", callback_data="sub_binance"))
+    kb.add(types.InlineKeyboardButton("📷 إرسال إيصال يدوي", callback_data="sub_manual"))
+    bot.send_message(chat_id,
+        f"💳 *تفعيل الاشتراك الشهري*\n\n"
+        f"💵 السعر: *{price_str()}* / شهر\n\n"
         f"• Binance Pay ID: `983969145`\n"
         f"• جوال باي: `0597599642`\n\n"
-        f"ادفع ثم أرسل صورة الإيصال، أو استخدم زر الدفع المباشر.",
-        parse_mode="Markdown",
-        reply_markup=markup
-    )
+        "ادفع ثم أرسل صورة الإيصال أو استخدم زر الدفع المباشر\\.",
+        reply_markup=kb)
 
-@bot.message_handler(commands=['subscribe'])
-def cmd_subscribe(message):
-    _do_subscribe(message.chat.id)
+@bot.message_handler(commands=["subscribe"])
+def cmd_subscribe(m): _do_subscribe(m.chat.id)
 
 @bot.message_handler(func=lambda m: m.text == "💳 اشتراك")
-def btn_subscribe(message):
-    _do_subscribe(message.chat.id)
+def btn_subscribe(m): _do_subscribe(m.chat.id)
 
-# ─────────────────────────────────────────────
-# 12. مساعدة
-# ─────────────────────────────────────────────
-def _do_help(chat_id):
-    bot.send_message(
-        chat_id,
+# ── /help + زر ──────────────────────────────────────
+def _do_help(chat_id: int):
+    bot.send_message(chat_id,
         "📖 *قائمة الأوامر:*\n\n"
         "/check — فحص المودل الآن\n"
         "/status — حالة حسابك\n"
         "/subscribe — تفعيل اشتراك\n"
         "/unlink — إلغاء ربط حسابك\n\n"
         "💡 *البوت يُخفي تلقائياً:*\n"
-        "• التكاليف المسلّمة\n"
-        "• الاختبارات المنتهية أو المحلولة\n"
-        "• الأحداث التي مضى وقتها",
-        parse_mode="Markdown"
-    )
+        "• التكاليف المسلّمة \\(يفحص الصفحة مباشرة\\)\n"
+        "• الكويزات المحلولة أو المنتهية المحاولات\n"
+        "• الأحداث التي مضى وقتها")
 
-@bot.message_handler(commands=['help'])
-def cmd_help(message):
-    _do_help(message.chat.id)
+@bot.message_handler(commands=["help"])
+def cmd_help(m): _do_help(m.chat.id)
 
 @bot.message_handler(func=lambda m: m.text == "❓ مساعدة")
-def btn_help(message):
-    _do_help(message.chat.id)
+def btn_help(m): _do_help(m.chat.id)
 
-# ─────────────────────────────────────────────
-# 13. إلغاء الربط
-# ─────────────────────────────────────────────
-@bot.message_handler(commands=['unlink'])
-def cmd_unlink(message):
-    conn = get_db_connection()
-    conn.cursor().execute(
-        'UPDATE users SET username=NULL, password=NULL WHERE chat_id=?', (message.chat.id,)
-    )
-    conn.commit(); conn.close()
-    bot.send_message(message.chat.id, "🔓 تم إلغاء الربط. استخدم /check للربط من جديد.")
+# ── /unlink ──────────────────────────────────────────
+@bot.message_handler(commands=["unlink"])
+def cmd_unlink(m):
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE users SET username=NULL, password=NULL WHERE chat_id=?", (m.chat.id,)
+        )
+    bot.send_message(m.chat.id, "🔓 تم إلغاء الربط\\. استخدم /check للربط من جديد\\.")
 
-# ─────────────────────────────────────────────
-# 14. ربط الحساب (خطوات)
-# ─────────────────────────────────────────────
-def _step_get_user(message):
-    user = message.text.strip()
-    m    = bot.send_message(message.chat.id, "🔐 أرسل كلمة مرور المودل:")
-    bot.register_next_step_handler(m, lambda msg: _step_save(msg, user))
+# ── ربط الحساب (خطوات) ──────────────────────────────
+def _step_user(msg):
+    # تحقق أن الرسالة نص
+    if not msg.text:
+        wm = bot.send_message(msg.chat.id, "❌ أرسل الرقم الجامعي كنص:")
+        bot.register_next_step_handler(wm, _step_user)
+        return
+    user = msg.text.strip()
+    wm   = bot.send_message(msg.chat.id, "🔐 أرسل كلمة المرور:")
+    bot.register_next_step_handler(wm, lambda m2: _step_pwd(m2, user))
 
-def _step_save(message, user):
-    pwd = message.text.strip()
-    wm  = bot.send_message(message.chat.id, "⏳ جاري التحقق من بياناتك...")
-    res = run_moodle_engine(user, pwd)
+def _step_pwd(msg, user):
+    if not msg.text:
+        wm = bot.send_message(msg.chat.id, "❌ أرسل كلمة المرور كنص:")
+        bot.register_next_step_handler(wm, lambda m2: _step_pwd(m2, user))
+        return
+    pwd = msg.text.strip()
+    wm  = bot.send_message(msg.chat.id, "⏳ جاري التحقق\\.\\.\\.")
+    res = run_moodle(user, pwd)
     if res["status"] == "success":
-        conn = get_db_connection()
-        conn.cursor().execute(
-            'INSERT OR REPLACE INTO users (chat_id, username, password) VALUES (?,?,?)',
-            (message.chat.id, user, pwd)
-        )
-        conn.commit(); conn.close()
-        bot.edit_message_text(
-            f"✅ تم الربط بنجاح! ستصلك تقارير كل 6 ساعات.\n\n{res['message']}",
-            message.chat.id, wm.message_id
-        )
+        with get_db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO users (chat_id, username, password) VALUES (?,?,?)",
+                (msg.chat.id, user, pwd)
+            )
+        try:
+            bot.edit_message_text(
+                f"✅ تم الربط\\! ستصلك تقارير كل 6 ساعات\\.\n\n{res['message']}",
+                msg.chat.id, wm.message_id
+            )
+        except Exception:
+            bot.send_message(msg.chat.id, f"✅ تم الربط\\!\n\n{res['message']}")
     else:
-        bot.edit_message_text(res["message"], message.chat.id, wm.message_id)
+        try:
+            bot.edit_message_text(res["message"], msg.chat.id, wm.message_id)
+        except Exception:
+            bot.send_message(msg.chat.id, res["message"])
 
-# ─────────────────────────────────────────────
-# 15. استلام الإيصالات اليدوية
-# ─────────────────────────────────────────────
-@bot.message_handler(content_types=['photo'])
-def handle_photo(message):
-    markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("✅ تفعيل شهر", callback_data=f"pay_{message.chat.id}_monthly"),
-        types.InlineKeyboardButton("❌ رفض",        callback_data=f"rej_{message.chat.id}")
+# ── استلام الإيصالات ────────────────────────────────
+@bot.message_handler(content_types=["photo"])
+def handle_photo(m):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("✅ تفعيل شهر", callback_data=f"pay_{m.chat.id}"),
+        types.InlineKeyboardButton("❌ رفض",        callback_data=f"rej_{m.chat.id}")
     )
-    bot.send_photo(
-        ADMIN_ID, message.photo[-1].file_id,
-        caption=(f"📩 *طلب تفعيل يدوي*\n"
-                 f"👤 ID: `{message.chat.id}`\n"
-                 f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"),
-        reply_markup=markup, parse_mode="Markdown"
-    )
-    bot.reply_to(message, "⏳ تم إرسال الإيصال. سيُشعرك الأدمن فور المراجعة.")
+    try:
+        bot.send_photo(ADMIN_ID, m.photo[-1].file_id,
+            caption=f"📩 *طلب تفعيل يدوي*\n👤 ID: `{m.chat.id}`\n📅 {datetime.now():%Y-%m-%d %H:%M}",
+            reply_markup=kb)
+        bot.reply_to(m, "⏳ تم إرسال الإيصال\\. سيُشعرك الأدمن فور المراجعة\\.")
+    except Exception as e:
+        log.error(f"handle_photo error: {e}")
+        bot.reply_to(m, "⚠️ حدث خطأ أثناء الإرسال\\. حاول مجدداً\\.")
 
-# ─────────────────────────────────────────────
-# 16. Callbacks
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════
+# 9. Callbacks
+# ══════════════════════════════════════════════════════
+
 @bot.callback_query_handler(func=lambda c: c.data == "sub_binance")
-def cb_sub_binance(call):
+def cb_binance(call):
     bot.answer_callback_query(call.id, "⏳ جاري إنشاء رابط الدفع...")
-    pay_url, result = create_binance_order(call.message.chat.id)
-    if pay_url:
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("💳 ادفع الآن", url=pay_url))
-        markup.add(types.InlineKeyboardButton("✅ تحقق من الدفع", callback_data=f"verify_{result}"))
-        bot.send_message(
-            call.message.chat.id,
-            "🔗 اضغط *ادفع الآن* للدفع.\nبعد الدفع اضغط *تحقق من الدفع* للتفعيل الفوري.",
-            parse_mode="Markdown", reply_markup=markup
-        )
+    url, result = binance_create(call.message.chat.id)
+    if url:
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("💳 ادفع الآن", url=url))
+        kb.add(types.InlineKeyboardButton("✅ تحقق من الدفع", callback_data=f"verify_{result}"))
+        bot.send_message(call.message.chat.id,
+            f"💵 المبلغ: *{price_str()}*\n\n"
+            "اضغط *ادفع الآن* ثم عد واضغط *تحقق من الدفع* للتفعيل الفوري\\.",
+            reply_markup=kb)
     else:
-        bot.send_message(call.message.chat.id, f"❌ {result}\nأرسل الإيصال يدوياً.")
+        bot.send_message(call.message.chat.id, f"❌ {result}\nأرسل الإيصال يدوياً\\.")
 
 @bot.callback_query_handler(func=lambda c: c.data == "sub_manual")
-def cb_sub_manual(call):
+def cb_manual(call):
     bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, "📷 أرسل صورة الإيصال وسيراجعها الأدمن.")
+    bot.send_message(call.message.chat.id, "📷 أرسل صورة الإيصال وسيراجعها الأدمن\\.")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("verify_"))
 def cb_verify(call):
-    order_id = call.data.replace("verify_", "")
+    order_id = call.data[7:]
     bot.answer_callback_query(call.id, "⏳ جاري التحقق...")
-    status = check_binance_order(order_id)
-    if status == "PAID":
-        conn = get_db_connection()
-        row  = conn.cursor().execute(
-            "SELECT chat_id FROM pending_payments WHERE order_id=?", (order_id,)
-        ).fetchone()
-        conn.close()
+    st = binance_query(order_id)
+    if st == "PAID":
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT chat_id FROM payments WHERE order_id=?", (order_id,)
+            ).fetchone()
         if row:
-            activate_subscription(row[0], "monthly")
-            conn = get_db_connection()
-            conn.cursor().execute("UPDATE pending_payments SET status='paid' WHERE order_id=?", (order_id,))
-            conn.commit(); conn.close()
-            bot.send_message(call.message.chat.id, "🎉 تم تفعيل اشتراكك بنجاح!")
+            activate(row["chat_id"], "monthly")
+            with get_db() as conn:
+                conn.execute("UPDATE payments SET status='paid' WHERE order_id=?", (order_id,))
+            bot.send_message(call.message.chat.id, "🎉 تم تفعيل اشتراكك بنجاح\\!")
         else:
-            bot.send_message(call.message.chat.id, "⚠️ لم يُعثر على الطلب.")
-    elif status == "UNPAID":
-        bot.send_message(call.message.chat.id, "⚠️ لم تصل الدفعة بعد. انتظر وأعد المحاولة.")
+            bot.send_message(call.message.chat.id, "⚠️ لم يُعثر على الطلب\\.")
+    elif st == "UNPAID":
+        bot.send_message(call.message.chat.id,
+            "⏳ لم تصل الدفعة بعد\\. انتظر دقيقة وأعد المحاولة\\.")
+    elif st in ("CANCELLED", "EXPIRED"):
+        bot.send_message(call.message.chat.id,
+            "❌ انتهت صلاحية الطلب\\. أنشئ طلباً جديداً من /subscribe")
     else:
-        bot.send_message(call.message.chat.id, "❌ انتهت صلاحية الطلب. أنشئ طلباً جديداً من /subscribe")
+        bot.send_message(call.message.chat.id,
+            "⚠️ لم يرد Binance\\. حاول لاحقاً\\.")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("pay_") or c.data.startswith("rej_"))
 def cb_admin(call):
     if call.from_user.id != ADMIN_ID:
         bot.answer_callback_query(call.id, "⛔ ليس لديك صلاحية.")
         return
-    parts  = call.data.split("_")
-    action = parts[0]
-    uid    = int(parts[1])
-
+    action, uid_str = call.data.split("_", 1)
+    uid = int(uid_str)
     if action == "pay":
-        activate_subscription(uid, "monthly")
-        bot.send_message(uid, "✅ تم تفعيل اشتراكك لمدة شهر!")
-        bot.edit_message_caption(
-            f"✅ تم تفعيل `{uid}`",
-            call.message.chat.id, call.message.message_id, parse_mode="Markdown"
-        )
+        activate(uid, "monthly")
+        bot.send_message(uid, "✅ تم تفعيل اشتراكك لمدة شهر\\!")
+        try:
+            bot.edit_message_caption(
+                f"✅ تم تفعيل `{uid}`",
+                call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
     elif action == "rej":
-        bot.send_message(uid, "❌ تم رفض طلبك. تأكد من إرسال إيصال صحيح أو تواصل مع الدعم.")
-        bot.edit_message_caption(
-            f"❌ رُفض طلب `{uid}`",
-            call.message.chat.id, call.message.message_id, parse_mode="Markdown"
-        )
+        bot.send_message(uid, "❌ تم رفض طلبك\\. تأكد من إرسال إيصال صحيح أو تواصل مع الدعم\\.")
+        try:
+            bot.edit_message_caption(
+                f"❌ رُفض `{uid}`",
+                call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
     bot.answer_callback_query(call.id)
 
-# ─────────────────────────────────────────────
-# 17. أوامر الأدمن
-# ─────────────────────────────────────────────
-@bot.message_handler(commands=['vip'])
-def cmd_vip(message):
-    """تفعيل VIP لأي مستخدم — للأدمن فقط. /vip [ID]"""
-    if message.chat.id != ADMIN_ID:
-        return
-    parts = message.text.split()
+# ══════════════════════════════════════════════════════
+# 10. أوامر الأدمن
+# ══════════════════════════════════════════════════════
+
+def _admin_only(m) -> bool:
+    return m.chat.id == ADMIN_ID
+
+@bot.message_handler(commands=["vip"])
+def cmd_vip(m):
+    """/vip [chat_id] — تفعيل VIP"""
+    if not _admin_only(m): return
+    parts = m.text.split()
     if len(parts) < 2:
-        bot.send_message(message.chat.id, "الاستخدام: /vip [chat_id]")
-        return
+        bot.send_message(m.chat.id, "الاستخدام: `/vip [chat_id]`"); return
     try:
         uid = int(parts[1])
     except ValueError:
-        bot.send_message(message.chat.id, "❌ ID غير صحيح.")
-        return
-    conn = get_db_connection()
-    conn.cursor().execute('INSERT OR IGNORE INTO users (chat_id) VALUES (?)', (uid,))
-    conn.commit(); conn.close()
-    activate_subscription(uid, "VIP")
-    try:
-        bot.send_message(uid, "🌟 تم تفعيل اشتراك VIP الخاص بك من قِبل الإدارة!")
-    except:
-        pass
-    bot.send_message(message.chat.id, f"✅ تم تفعيل VIP للمستخدم `{uid}`.", parse_mode="Markdown")
+        bot.send_message(m.chat.id, "❌ ID غير صحيح\\."); return
+    activate(uid, "VIP")
+    try: bot.send_message(uid, "🌟 تم تفعيل اشتراك VIP من قِبل الإدارة\\!")
+    except Exception: pass
+    bot.send_message(m.chat.id, f"✅ VIP فعّال للمستخدم `{uid}`\\.")
 
-@bot.message_handler(commands=['revoke'])
-def cmd_revoke(message):
-    """إلغاء اشتراك مستخدم. /revoke [ID]"""
-    if message.chat.id != ADMIN_ID:
-        return
-    parts = message.text.split()
+@bot.message_handler(commands=["revoke"])
+def cmd_revoke(m):
+    """/revoke [chat_id] — إلغاء اشتراك"""
+    if not _admin_only(m): return
+    parts = m.text.split()
     if len(parts) < 2:
-        bot.send_message(message.chat.id, "الاستخدام: /revoke [chat_id]")
-        return
-    uid = int(parts[1])
-    conn = get_db_connection()
-    conn.cursor().execute('UPDATE users SET is_vip=0, expiry_date=NULL WHERE chat_id=?', (uid,))
-    conn.commit(); conn.close()
-    bot.send_message(message.chat.id, f"✅ تم إلغاء اشتراك `{uid}`.", parse_mode="Markdown")
+        bot.send_message(m.chat.id, "الاستخدام: `/revoke [chat_id]`"); return
+    try:
+        uid = int(parts[1])
+    except ValueError:
+        bot.send_message(m.chat.id, "❌ ID غير صحيح\\."); return
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE users SET is_vip=0, expiry_date=NULL WHERE chat_id=?", (uid,)
+        )
+    bot.send_message(m.chat.id, f"✅ تم إلغاء اشتراك `{uid}`\\.")
 
-@bot.message_handler(commands=['holiday'])
-def cmd_holiday(message):
+@bot.message_handler(commands=["holiday"])
+def cmd_holiday(m):
     global IS_HOLIDAY
-    if message.chat.id != ADMIN_ID:
-        return
+    if not _admin_only(m): return
     IS_HOLIDAY = not IS_HOLIDAY
-    bot.send_message(message.chat.id, "🏖️ وضع العطلة مفعّل" if IS_HOLIDAY else "✅ وضع العطلة ملغى")
+    bot.send_message(m.chat.id, "🏖️ وضع العطلة مفعّل" if IS_HOLIDAY else "✅ وضع العطلة ملغى")
 
-@bot.message_handler(commands=['stats'])
-def cmd_stats(message):
-    if message.chat.id != ADMIN_ID:
-        return
-    conn   = get_db_connection()
-    total  = conn.cursor().execute('SELECT COUNT(*) FROM users').fetchone()[0]
-    linked = conn.cursor().execute('SELECT COUNT(*) FROM users WHERE username IS NOT NULL').fetchone()[0]
-    vip    = conn.cursor().execute('SELECT COUNT(*) FROM users WHERE is_vip=1').fetchone()[0]
-    active = conn.cursor().execute(
-        "SELECT COUNT(*) FROM users WHERE expiry_date > datetime('now')"
-    ).fetchone()[0]
-    conn.close()
-    bot.send_message(
-        message.chat.id,
+@bot.message_handler(commands=["stats"])
+def cmd_stats(m):
+    if not _admin_only(m): return
+    with get_db() as conn:
+        total   = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        linked  = conn.execute("SELECT COUNT(*) FROM users WHERE username IS NOT NULL").fetchone()[0]
+        vip     = conn.execute("SELECT COUNT(*) FROM users WHERE is_vip=1").fetchone()[0]
+        active  = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE expiry_date > datetime('now')"
+        ).fetchone()[0]
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM payments WHERE status='pending'"
+        ).fetchone()[0]
+    bot.send_message(m.chat.id,
         f"📊 *إحصائيات:*\n\n"
         f"👥 المستخدمون: {total}\n"
         f"🔗 مرتبطون: {linked}\n"
         f"🌟 VIP: {vip}\n"
         f"✅ اشتراك نشط: {active}\n"
-        f"🏖️ وضع العطلة: {'مفعّل' if IS_HOLIDAY else 'ملغى'}",
-        parse_mode="Markdown"
-    )
+        f"⏳ طلبات دفع معلقة: {pending}\n"
+        f"💵 سعر الاشتراك: {price_str()}\n"
+        f"🏖️ وضع العطلة: {'مفعّل' if IS_HOLIDAY else 'ملغى'}")
 
-@bot.message_handler(commands=['broadcast'])
-def cmd_broadcast(message):
-    if message.chat.id != ADMIN_ID:
-        return
-    text = message.text.replace('/broadcast', '', 1).strip()
+@bot.message_handler(commands=["broadcast"])
+def cmd_broadcast(m):
+    if not _admin_only(m): return
+    text = m.text.replace("/broadcast", "", 1).strip()
     if not text:
-        bot.send_message(message.chat.id, "الاستخدام: /broadcast [الرسالة]")
-        return
-    conn  = get_db_connection()
-    users = conn.cursor().execute('SELECT chat_id FROM users').fetchall()
-    conn.close()
+        bot.send_message(m.chat.id, "الاستخدام: `/broadcast [الرسالة]`"); return
+    with get_db() as conn:
+        uids = [r[0] for r in conn.execute("SELECT chat_id FROM users").fetchall()]
     ok = 0
-    for (uid,) in users:
+    for uid in uids:
         try:
-            bot.send_message(uid, f"📢 *إشعار من الإدارة:*\n\n{text}", parse_mode="Markdown")
+            bot.send_message(uid, f"📢 *إشعار:*\n\n{text}")
             ok += 1
-        except:
+        except Exception:
             pass
-    bot.send_message(message.chat.id, f"✅ أُرسلت لـ {ok}/{len(users)} مستخدم.")
+    bot.send_message(m.chat.id, f"✅ أُرسلت لـ {ok}/{len(uids)} مستخدم\\.")
 
-# ─────────────────────────────────────────────
-# 18. التقارير الدورية (كل 6 ساعات)
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════
+# 11. التقارير الدورية
+# ══════════════════════════════════════════════════════
 def broadcast_reports():
     if IS_HOLIDAY:
         return
-    conn  = get_db_connection()
-    users = conn.cursor().execute(
-        'SELECT chat_id, username, password FROM users WHERE username IS NOT NULL'
-    ).fetchall()
-    conn.close()
+    with get_db() as conn:
+        users = conn.execute(
+            "SELECT chat_id, username, password FROM users WHERE username IS NOT NULL"
+        ).fetchall()
 
-    for uid, user, pwd in users:
-        allowed, _ = check_access(uid)
-        if not allowed:
+    for row in users:
+        uid, user, pwd = row["chat_id"], row["username"], row["password"]
+        if not check_access(uid)[0]:
             continue
-
-        res = run_moodle_engine(user, pwd)
-        if res["status"] != "success":
+        res = run_moodle(user, pwd)
+        if res["status"] != "success" or "لا يوجد تحديثات" in res["message"]:
             continue
-
         msg = res["message"]
 
-        # لا ترسل إذا لا يوجد تحديثات
-        if "لا يوجد تحديثات" in msg:
-            continue
-
         # لا ترسل إذا نفس المحتوى السابق
-        content_hash = hashlib.md5(msg.encode()).hexdigest()
-        conn = get_db_connection()
-        row  = conn.cursor().execute('SELECT last_hash FROM users WHERE chat_id=?', (uid,)).fetchone()
-        if row and row[0] == content_hash:
-            conn.close()
-            continue
+        h = hashlib.md5(msg.encode()).hexdigest()
+        with get_db() as conn:
+            old = conn.execute("SELECT last_hash FROM users WHERE chat_id=?", (uid,)).fetchone()
+            if old and old["last_hash"] == h:
+                continue
+            try:
+                bot.send_message(uid, f"🔔 *تقرير المودل:*\n\n{msg}")
+                conn.execute(
+                    "UPDATE users SET last_hash=?, last_report=? WHERE chat_id=?",
+                    (h, datetime.now().strftime("%Y-%m-%d %H:%M"), uid)
+                )
+            except Exception as e:
+                log.warning(f"فشل إرسال تقرير لـ {uid}: {e}")
 
-        try:
-            bot.send_message(uid, f"🔔 *تقرير المودل:*\n\n{msg}", parse_mode="Markdown")
-            conn.cursor().execute(
-                'UPDATE users SET last_hash=?, last_report=? WHERE chat_id=?',
-                (content_hash, datetime.now().strftime('%Y-%m-%d %H:%M'), uid)
-            )
-            conn.commit()
-        except:
-            pass
-        finally:
-            conn.close()
-
-def auto_runner():
+# ══════════════════════════════════════════════════════
+# 12. المُجدوِل الخلفي
+# ══════════════════════════════════════════════════════
+def _scheduler():
     schedule.every(6).hours.do(broadcast_reports)
-    schedule.every(2).minutes.do(poll_pending_payments)
+    schedule.every(2).minutes.do(poll_payments)
+    schedule.every(12).hours.do(refresh_rate)   # كل 12 ساعة يكفي لسعر الصرف
     while True:
         schedule.run_pending()
         time.sleep(30)
 
-# ─────────────────────────────────────────────
-# 19. التشغيل
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════
+# 13. التشغيل
+# ══════════════════════════════════════════════════════
 if __name__ == "__main__":
     init_db()
-    threading.Thread(target=auto_runner, daemon=True).start()
-    bot.infinity_polling()
+    refresh_rate()
+    threading.Thread(target=_scheduler, daemon=True).start()
+    log.info("البوت يعمل...")
+    bot.infinity_polling(timeout=30, long_polling_timeout=20)
