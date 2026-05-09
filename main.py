@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 from telebot import types
 
 # --- 1. الإعدادات الأساسية ---
-TOKEN = "8702727538:AAE4rcAcrLeo4Luf2DeLgv3qtMWh2bleKic"
-GROQ_KEY = "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"
+TOKEN = os.getenv("TOKEN")
+GROQ_KEY = os.getenv("GROQ_KEY")
 ADMIN_ID = 7840931571  
 BINANCE_PAY_ID = "983969145"
 FREE_TRIAL_END = datetime(2026, 6, 1) # فترة تجريبية مجانية للجميع
