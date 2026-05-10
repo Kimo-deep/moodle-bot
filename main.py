@@ -43,7 +43,7 @@ DB_LOCK = threading.Lock()
 # إدارة قاعدة البيانات
 # =====================================================
 def get_db():
-    conn = sqlite3.connect("users.db", check_same_thread=False, timeout=30)
+    conn = sqlite3.connect("/app/data/users.db", check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
