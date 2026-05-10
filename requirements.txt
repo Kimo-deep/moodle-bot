@@ -1,5 +1,5 @@
 pyTelegramBotAPI
 requests
 beautifulsoup4
-groq
 schedule
+cryptography
