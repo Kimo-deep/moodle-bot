@@ -40,7 +40,7 @@ ADMIN_ID       = 7840931571
 FREE_TRIAL_END = datetime(2026, 6, 1)
 PRICE_USD      = 2.0
 ILS_PER_USD    = 3.5
-DB_PATH        = "users.db"
+DB_PATH        = "/app/data/users.db"
 REPORT_INTERVAL_HOURS = 6
 
 bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
