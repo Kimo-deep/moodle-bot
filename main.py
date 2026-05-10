@@ -18,12 +18,15 @@ from telebot import types
 # ══════════════════════════════════════════════════════════
 # 1. الإعدادات
 # ══════════════════════════════════════════════════════════
+DATA_DIR = "/app/data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.FileHandler(os.path.join(DATA_DIR, "bot.log"), encoding="utf-8"),
     ],
 )
 log = logging.getLogger(__name__)
@@ -36,11 +39,11 @@ if not TOKEN:
     log.critical("❌ متغير TOKEN غير موجود. عيّنه في متغيرات البيئة ثم أعد التشغيل.")
     raise SystemExit(1)
 
-ADMIN_ID       = 7840931571
-FREE_TRIAL_END = datetime(2026, 6, 1)
-PRICE_USD      = 2.0
-ILS_PER_USD    = 3.5
-DB_PATH        = "/app/data/users.db"
+ADMIN_ID              = 7840931571
+FREE_TRIAL_END        = datetime(2026, 6, 1)
+PRICE_USD             = 2.0
+ILS_PER_USD           = 3.7
+DB_PATH               = os.path.join(DATA_DIR, "users.db")
 REPORT_INTERVAL_HOURS = 6
 
 bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
@@ -346,7 +349,6 @@ def _assign_done(session, url: str) -> bool:
             return False
         soup = BeautifulSoup(resp.text, "lxml")
 
-        # فحص جدول حالة التسليم
         for tr in soup.find_all("tr"):
             th = tr.find("th")
             td = tr.find("td")
@@ -356,29 +358,16 @@ def _assign_done(session, url: str) -> bool:
             value = td.get_text(strip=True).lower()
             if not any(k in label for k in ["حالة التسليم", "submission status", "status"]):
                 continue
-            # لم يُسلَّم بعد
-            if any(k in value for k in [
-                "لم يُسلَّم", "no submission", "not submitted", "لم يتم",
-            ]):
+            if any(k in value for k in ["لم يُسلَّم", "no submission", "not submitted", "لم يتم"]):
                 return False
-            # تم التسليم
-            if any(k in value for k in [
-                "تم التسليم", "submitted for grading", "submitted",
-            ]):
+            if any(k in value for k in ["تم التسليم", "submitted for grading", "submitted"]):
                 return True
 
-        # فحص نصي عام
         page = soup.get_text(" ", strip=True).lower()
-        submitted_signals = [
-            "تعديل التسليم", "edit submission", "you have submitted",
-            "already submitted", "تم الإرسال", "تم التسليم",
-        ]
-        not_submitted_signals = [
-            "إضافة تسليم", "add submission", "لم تُسلِّم بعد",
-        ]
-        if any(s in page for s in submitted_signals):
+        if any(s in page for s in ["تعديل التسليم", "edit submission", "you have submitted",
+                                    "already submitted", "تم الإرسال", "تم التسليم"]):
             return True
-        if any(s in page for s in not_submitted_signals):
+        if any(s in page for s in ["إضافة تسليم", "add submission", "لم تُسلِّم بعد"]):
             return False
         return False
     except Exception as e:
@@ -394,24 +383,18 @@ def _quiz_done(session, url: str) -> bool:
             return False
         soup = BeautifulSoup(resp.text, "lxml")
 
-        # جدول ملخص المحاولات
         if soup.find("table", {"class": lambda x: x and "quizattemptsummary" in x}):
             return True
 
         page = soup.get_text(" ", strip=True).lower()
-        done_signals = [
-            "لقد أنهيت", "your last attempt", "آخر محاولة", "no more attempts",
-            "لا محاولات متبقية", "مراجعة المحاولة", "review attempt",
-            "your grade", "درجتك", "grade:", "attempt 1", "المحاولة 1",
-            "you have already attempted", "نتائج الاختبار",
-        ]
-        open_signals = [
-            "attempt quiz now", "ابدأ الاختبار", "ابدأ المحاولة",
-            "start attempt",
-        ]
-        if any(s in page for s in done_signals):
+        if any(s in page for s in ["لقد أنهيت", "your last attempt", "آخر محاولة",
+                                    "no more attempts", "لا محاولات متبقية",
+                                    "مراجعة المحاولة", "review attempt", "your grade",
+                                    "درجتك", "grade:", "attempt 1", "المحاولة 1",
+                                    "you have already attempted", "نتائج الاختبار"]):
             return True
-        if any(s in page for s in open_signals):
+        if any(s in page for s in ["attempt quiz now", "ابدأ الاختبار",
+                                    "ابدأ المحاولة", "start attempt"]):
             return False
         return False
     except Exception as e:
@@ -423,9 +406,11 @@ def _quiz_done(session, url: str) -> bool:
 # 7. تنسيق التقرير
 # ══════════════════════════════════════════════════════════
 def _fmt_exam(ev: dict) -> str:
-    lines = [f"▪️ *{ev['name']}*",
-             f"   📌 {ev['course']}",
-             f"   👨‍🏫 {ev['doctor']}"]
+    lines = [
+        f"▪️ *{ev['name']}*",
+        f"   📌 {ev['course']}",
+        f"   👨‍🏫 {ev['doctor']}",
+    ]
     if ev.get("date_open") and ev.get("date_close"):
         lines += [f"   🕐 يفتح: {ev['date_open']}", f"   🔒 يغلق: {ev['date_close']}"]
     elif ev.get("date_open"):
@@ -437,18 +422,22 @@ def _fmt_exam(ev: dict) -> str:
 
 def _fmt_task(ev: dict) -> str:
     t = ev.get("date_close") or ev.get("time", "")
-    lines = [f"▪️ *{ev['name']}*",
-             f"   📌 {ev['course']}",
-             f"   👨‍🏫 {ev['doctor']}"]
+    lines = [
+        f"▪️ *{ev['name']}*",
+        f"   📌 {ev['course']}",
+        f"   👨‍🏫 {ev['doctor']}",
+    ]
     if t:
         lines.append(f"   📅 آخر موعد: {t}")
     return "\n".join(lines)
 
 
 def _fmt_other(ev: dict) -> str:
-    lines = [f"▪️ *{ev['name']}*",
-             f"   📌 {ev['course']}",
-             f"   👨‍🏫 {ev['doctor']}"]
+    lines = [
+        f"▪️ *{ev['name']}*",
+        f"   📌 {ev['course']}",
+        f"   👨‍🏫 {ev['doctor']}",
+    ]
     if ev.get("time"):
         lines.append(f"   📅 {ev['time']}")
     return "\n".join(lines)
@@ -478,10 +467,8 @@ def run_moodle(username: str, password: str, chat_id: int = None) -> dict:
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     )
-
     login_url = f"{MOODLE_BASE}/login/index.php"
     try:
-        # ── تسجيل الدخول ──
         resp0 = session.get(login_url, timeout=20)
         soup0 = BeautifulSoup(resp0.text, "lxml")
         ti    = soup0.find("input", {"name": "logintoken"})
@@ -495,11 +482,9 @@ def run_moodle(username: str, password: str, chat_id: int = None) -> dict:
             timeout=20,
             allow_redirects=True,
         )
-
         if "login" in resp.url and "logout" not in resp.url:
             return {"status": "fail", "message": "❌ بيانات المودل غير صحيحة."}
 
-        # ── صفحة التقويم ──
         cal_url = f"{MOODLE_BASE}/calendar/view.php?view=upcoming"
         soup    = BeautifulSoup(session.get(cal_url, timeout=20).text, "lxml")
 
@@ -508,16 +493,14 @@ def run_moodle(username: str, password: str, chat_id: int = None) -> dict:
 
         for ev_div in soup.find_all("div", {"class": "event"}):
             raw_txt = ev_div.get_text(" ", strip=True)
-
-            ev       = _extract_event(ev_div)
-            ll       = ev["url_lower"]
-            tl       = ev["raw"].lower()
+            ev      = _extract_event(ev_div)
+            ll      = ev["url_lower"]
+            tl      = ev["raw"].lower()
 
             is_quiz   = "quiz"   in ll or any(w in tl for w in _EXAM_KW)
             is_assign = "assign" in ll or any(w in tl for w in _ASSIGN_KW)
             is_meet   = any(x in ll for x in _MEET_KW) or "لقاء" in tl
 
-            # ── التحقق الدقيق من حالة التسليم ──
             if ev["url"]:
                 if is_quiz and not is_meet:
                     if _quiz_done(session, ev["url"]):
@@ -545,7 +528,6 @@ def run_moodle(username: str, password: str, chat_id: int = None) -> dict:
 
         exams = [_fmt_exam(e) for e in _merge_exams(exams_raw)]
 
-        # ── بناء التقرير ──
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         parts   = [f"🕐 *آخر تحديث: {now_str}*\n"]
 
@@ -573,10 +555,25 @@ def run_moodle(username: str, password: str, chat_id: int = None) -> dict:
 
 
 # ══════════════════════════════════════════════════════════
-# 9. الجدولة — تقرير كل 6 ساعات
+# 9. الجدولة — تقارير + تذكيرات الاشتراك
 # ══════════════════════════════════════════════════════════
+REMINDER_DAYS = [7, 5, 3, 1]
+
+
+def _sub_message() -> str:
+    """نص الاشتراك الموحّد — يُستخدم في أكثر من مكان."""
+    if BIN_CERT and BIN_SECRET:
+        how = "اضغط *💳 اشتراك* لإتمام الدفع الآن عبر Binance Pay."
+    else:
+        how = "تواصل مع المشرف مباشرة للاشتراك."
+    return (
+        f"💵 السعر: *{price_str()}* شهرياً\n"
+        f"📅 الاشتراك يمنحك وصولاً كاملاً لمدة 30 يوماً.\n\n"
+        f"{how}"
+    )
+
+
 def _auto_report_all():
-    """يرسل تقريراً تلقائياً لجميع المستخدمين الذين لديهم بيانات مودل."""
     log.info("⏰ بدء إرسال التقارير التلقائية…")
     with get_db() as conn:
         rows = conn.execute(
@@ -603,8 +600,60 @@ def _auto_report_all():
     log.info("✅ انتهى إرسال التقارير التلقائية")
 
 
+def _send_expiry_reminders():
+    """يرسل تذكيرات قبل انتهاء الاشتراك بـ 7 / 5 / 3 / 1 أيام."""
+    now = datetime.now()
+    log.info("🔔 فحص تذكيرات الاشتراك…")
+
+    with get_db() as conn:
+        rows = conn.execute("SELECT chat_id, expiry_date, is_vip FROM users").fetchall()
+
+    for row in rows:
+        chat_id = row["chat_id"]
+
+        # ── مشتركون عاديون ──
+        if row["expiry_date"] and not row["is_vip"]:
+            try:
+                exp  = datetime.strptime(row["expiry_date"], "%Y-%m-%d %H:%M:%S")
+                days = (exp - now).days
+                if days in REMINDER_DAYS:
+                    try:
+                        bot.send_message(
+                            chat_id,
+                            f"⏰ *تذكير بالاشتراك*\n\n"
+                            f"ينتهي اشتراكك خلال *{days} {'يوم' if days > 1 else 'يوم واحد'}*.\n\n"
+                            f"{_sub_message()}",
+                        )
+                        log.info(f"تذكير أُرسل للمستخدم {chat_id} — متبقٍ {days} يوم")
+                    except Exception as e:
+                        log.warning(f"فشل إرسال تذكير للمستخدم {chat_id}: {e}")
+            except ValueError:
+                pass
+
+        # ── الفترة التجريبية المجانية ──
+        if now < FREE_TRIAL_END:
+            days_left = (FREE_TRIAL_END - now).days
+            if days_left in REMINDER_DAYS:
+                try:
+                    bot.send_message(
+                        chat_id,
+                        f"⏰ *تنبيه — الفترة التجريبية*\n\n"
+                        f"تنتهي الفترة التجريبية المجانية خلال *{days_left} {'يوم' if days_left > 1 else 'يوم واحد'}*"
+                        f" بتاريخ {FREE_TRIAL_END.strftime('%Y/%m/%d')}.\n\n"
+                        f"اشترك الآن للاستمرار في استخدام البوت:\n\n"
+                        f"{_sub_message()}",
+                    )
+                    log.info(f"تذكير تجريبي أُرسل للمستخدم {chat_id} — متبقٍ {days_left} يوم")
+                except Exception as e:
+                    log.warning(f"فشل إرسال تذكير تجريبي للمستخدم {chat_id}: {e}")
+                time.sleep(0.05)
+
+    log.info("✅ انتهى فحص التذكيرات")
+
+
 def _run_scheduler():
     schedule.every(REPORT_INTERVAL_HOURS).hours.do(_auto_report_all)
+    schedule.every().day.at("09:00").do(_send_expiry_reminders)
     while True:
         schedule.run_pending()
         time.sleep(60)
@@ -614,8 +663,8 @@ def _run_scheduler():
 # 10. Binance Pay
 # ══════════════════════════════════════════════════════════
 def _bin_headers(body: str) -> dict:
-    nonce = uuid.uuid4().hex
-    ts    = str(int(time.time() * 1000))
+    nonce   = uuid.uuid4().hex
+    ts      = str(int(time.time() * 1000))
     payload = f"{ts}\n{nonce}\n{body}\n"
     sig = hmac.new(
         BIN_SECRET.encode(),
@@ -754,12 +803,15 @@ def cmd_start(msg):
     ok, status = check_access(chat_id)
     trial_note = ""
     if ok and status == "تجريبي مجاني":
-        trial_note = f"\n\n🎁 أنت الآن في الفترة التجريبية المجانية حتى {FREE_TRIAL_END.strftime('%Y/%m/%d')}."
-
+        trial_note = (
+            f"\n\n🎁 أنت الآن في الفترة التجريبية المجانية "
+            f"حتى {FREE_TRIAL_END.strftime('%Y/%m/%d')}."
+        )
     bot.send_message(
         chat_id,
         f"👋 مرحباً {msg.from_user.first_name}!\n\n"
-        f"أنا *بوت مودل الأقصى* — أراقب جدولك وأرسل لك تقارير تلقائية كل *{REPORT_INTERVAL_HOURS} ساعات*."
+        f"أنا *بوت مودل الأقصى* — أراقب جدولك وأرسل لك تقارير تلقائية "
+        f"كل *{REPORT_INTERVAL_HOURS} ساعات*."
         f"{trial_note}\n\n"
         "ابدأ بإدخال بيانات المودل عبر ⚙️ *إعداداتي*.",
         reply_markup=main_kb(chat_id),
@@ -773,7 +825,6 @@ def cmd_admin(msg):
     bot.send_message(msg.chat.id, "👑 *لوحة الإدارة*", reply_markup=admin_kb())
 
 
-# ── تقرير فوري ──
 @bot.message_handler(func=lambda m: m.text == "📊 تقريري الآن")
 def btn_report(msg):
     chat_id = msg.chat.id
@@ -785,33 +836,28 @@ def btn_report(msg):
             reply_markup=main_kb(chat_id),
         )
         return
-
     with get_db() as conn:
         row = conn.execute(
             "SELECT moodle_user, moodle_pass FROM users WHERE chat_id=?", (chat_id,)
         ).fetchone()
-
     if not row or not row["moodle_user"]:
         bot.send_message(
             chat_id,
             "⚙️ لم تُدخل بيانات المودل بعد.\n\nاضغط *⚙️ إعداداتي* لإضافتها.",
         )
         return
-
     wait = bot.send_message(chat_id, "⏳ جارٍ تحديث بياناتك من المودل…")
     result = run_moodle(row["moodle_user"], row["moodle_pass"], chat_id)
     try:
         bot.delete_message(chat_id, wait.message_id)
     except Exception:
         pass
-
     if result["status"] == "success":
         _send_long(chat_id, result["message"])
     else:
         bot.send_message(chat_id, result["message"])
 
 
-# ── الإعدادات ──
 @bot.message_handler(func=lambda m: m.text == "⚙️ إعداداتي")
 def btn_settings(msg):
     chat_id = msg.chat.id
@@ -819,15 +865,16 @@ def btn_settings(msg):
         row = conn.execute(
             "SELECT moodle_user, auto_report FROM users WHERE chat_id=?", (chat_id,)
         ).fetchone()
-
-    auto_on = bool(row["auto_report"]) if row else True
-    user_set = row["moodle_user"] if row else None
-    status_line = f"👤 مستخدم المودل: `{user_set}`" if user_set else "👤 لم تُحدَّد بيانات المودل بعد."
-
+    auto_on    = bool(row["auto_report"]) if row else True
+    user_set   = row["moodle_user"] if row else None
+    status_line = (
+        f"👤 مستخدم المودل: `{user_set}`"
+        if user_set else
+        "👤 لم تُحدَّد بيانات المودل بعد."
+    )
     bot.send_message(
         chat_id,
-        f"⚙️ *إعداداتك*\n\n{status_line}\n\n"
-        "اضغط الزر المناسب:",
+        f"⚙️ *إعداداتك*\n\n{status_line}\n\nاضغط الزر المناسب:",
         reply_markup=settings_kb(auto_on),
     )
 
@@ -859,18 +906,50 @@ def cb_update_creds(call):
     bot.send_message(chat_id, "✏️ أدخل *اسم المستخدم* في المودل (الرقم الجامعي):")
 
 
-# ── الاشتراك ──
 @bot.message_handler(func=lambda m: m.text == "💳 اشتراك")
 def btn_subscribe(msg):
     chat_id = msg.chat.id
     ok, status = check_access(chat_id)
+    now = datetime.now()
+
+    # ── خلال الفترة التجريبية: اعرض السعر وآلية الاشتراك مع العدّ التنازلي ──
+    if ok and status == "تجريبي مجاني":
+        days_left = (FREE_TRIAL_END - now).days
+        trial_info = (
+            f"🎁 *الفترة التجريبية المجانية*\n"
+            f"متبقٍ *{days_left} يوم* حتى {FREE_TRIAL_END.strftime('%Y/%m/%d')}.\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💳 *الاشتراك الشهري*\n\n"
+            f"{_sub_message()}"
+        )
+        if BIN_CERT and BIN_SECRET:
+            wait = bot.send_message(chat_id, "⏳ جارٍ إنشاء رابط الدفع…")
+            url, err = binance_create(chat_id)
+            try:
+                bot.delete_message(chat_id, wait.message_id)
+            except Exception:
+                pass
+            if url:
+                kb = types.InlineKeyboardMarkup()
+                kb.add(types.InlineKeyboardButton("💳 اشترك الآن", url=url))
+                bot.send_message(chat_id, trial_info, reply_markup=kb)
+            else:
+                bot.send_message(chat_id, trial_info)
+        else:
+            bot.send_message(chat_id, trial_info)
+        return
+
+    # ── مشترك فعّال (غير تجريبي) ──
     if ok:
         bot.send_message(
             chat_id,
-            f"✅ اشتراكك فعّال — الحالة: *{status}*\n\nيمكنك التجديد في أي وقت.",
+            f"✅ *اشتراكك فعّال*\n\n"
+            f"الحالة: *{status}*\n\n"
+            f"يمكنك التجديد في أي وقت:\n\n{_sub_message()}",
         )
         return
 
+    # ── غير مشترك ──
     if BIN_CERT and BIN_SECRET:
         wait = bot.send_message(chat_id, "⏳ جارٍ إنشاء طلب الدفع…")
         url, err = binance_create(chat_id)
@@ -883,21 +962,21 @@ def btn_subscribe(msg):
             kb.add(types.InlineKeyboardButton("💳 ادفع الآن", url=url))
             bot.send_message(
                 chat_id,
-                f"💳 *الاشتراك الشهري*\n\n💵 السعر: *{price_str()}*\n\n"
-                "اضغط الزر لإتمام الدفع عبر Binance Pay:",
+                f"💳 *الاشتراك الشهري*\n\n{_sub_message()}",
                 reply_markup=kb,
             )
         else:
-            bot.send_message(chat_id, f"⚠️ خطأ في إنشاء الدفع: {err}\n\nتواصل مع الإدارة.")
+            bot.send_message(
+                chat_id,
+                f"⚠️ خطأ في إنشاء الدفع: {err}\n\nتواصل مع الإدارة."
+            )
     else:
         bot.send_message(
             chat_id,
-            f"💳 *الاشتراك الشهري*\n\n💵 السعر: *{price_str()}*\n\n"
-            "للاشتراك تواصل مع المشرف مباشرة.",
+            f"💳 *الاشتراك الشهري*\n\n{_sub_message()}",
         )
 
 
-# ── مساعدة ──
 @bot.message_handler(func=lambda m: m.text == "ℹ️ مساعدة")
 def btn_help(msg):
     bot.send_message(
@@ -926,7 +1005,6 @@ def admin_users(msg):
         vip   = sum(1 for r in rows if r["is_vip"])
         sub   = sum(1 for r in rows if r["expiry_date"] and not r["is_vip"])
         creds = sum(1 for r in rows if r["moodle_user"])
-
     bot.send_message(
         ADMIN_ID,
         f"👥 *إحصاءات المستخدمين*\n\n"
@@ -972,13 +1050,11 @@ def handle_text(msg):
     d       = st.get("d", {})
     text    = msg.text.strip()
 
-    # ── إدخال اسم مستخدم مودل ──
     if s == "await_moodle_user":
         set_state(chat_id, "await_moodle_pass", {"user": text})
         bot.send_message(chat_id, "🔑 أدخل *كلمة المرور* في المودل:")
         return
 
-    # ── إدخال كلمة مرور مودل ──
     if s == "await_moodle_pass":
         username = d.get("user", "")
         password = text
@@ -988,17 +1064,17 @@ def handle_text(msg):
             bot.delete_message(chat_id, wait.message_id)
         except Exception:
             pass
-
         if result["status"] == "fail":
-            bot.send_message(chat_id, "❌ بيانات خاطئة، حاول مجدداً.\n\nأدخل *اسم المستخدم* مجدداً:")
+            bot.send_message(
+                chat_id,
+                "❌ بيانات خاطئة، حاول مجدداً.\n\nأدخل *اسم المستخدم* مجدداً:"
+            )
             set_state(chat_id, "await_moodle_user")
             return
-
         if result["status"] == "error":
             bot.send_message(chat_id, result["message"] + "\n\nجرب مجدداً لاحقاً.")
             clear_state(chat_id)
             return
-
         with get_db() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,)
@@ -1007,18 +1083,15 @@ def handle_text(msg):
                 "UPDATE users SET moodle_user=?, moodle_pass=? WHERE chat_id=?",
                 (username, password, chat_id),
             )
-
         clear_state(chat_id)
         bot.send_message(
             chat_id,
-            "✅ تم حفظ بياناتك بنجاح!\n\n"
-            f"📊 إليك أول تقرير لك:",
+            "✅ تم حفظ بياناتك بنجاح!\n\n📊 إليك أول تقرير لك:",
             reply_markup=main_kb(chat_id),
         )
         _send_long(chat_id, result["message"])
         return
 
-    # ── إذاعة ──
     if s == "await_broadcast" and chat_id == ADMIN_ID:
         with get_db() as conn:
             ids = [r["chat_id"] for r in conn.execute("SELECT chat_id FROM users").fetchall()]
@@ -1034,7 +1107,6 @@ def handle_text(msg):
         bot.send_message(ADMIN_ID, f"✅ الإذاعة انتهت — أُرسلت: {sent} | فشلت: {failed}")
         return
 
-    # ── تفعيل اشتراك ──
     if s == "await_activate_id" and chat_id == ADMIN_ID:
         try:
             target = int(text)
@@ -1042,14 +1114,16 @@ def handle_text(msg):
             clear_state(chat_id)
             bot.send_message(ADMIN_ID, f"✅ تم تفعيل اشتراك شهري للمستخدم `{target}`")
             try:
-                bot.send_message(target, "🎉 تم تفعيل اشتراكك الشهري! اضغط *📊 تقريري الآن* للبدء.")
+                bot.send_message(
+                    target,
+                    "🎉 تم تفعيل اشتراكك الشهري! اضغط *📊 تقريري الآن* للبدء."
+                )
             except Exception:
                 pass
         except ValueError:
             bot.send_message(ADMIN_ID, "❌ ID غير صحيح، أدخل رقماً.")
         return
 
-    # ── منح VIP ──
     if s == "await_vip_id" and chat_id == ADMIN_ID:
         try:
             target = int(text)
@@ -1057,7 +1131,10 @@ def handle_text(msg):
             clear_state(chat_id)
             bot.send_message(ADMIN_ID, f"🏆 تم منح VIP للمستخدم `{target}`")
             try:
-                bot.send_message(target, "🏆 تم ترقيتك إلى VIP! اضغط *📊 تقريري الآن* للبدء.")
+                bot.send_message(
+                    target,
+                    "🏆 تم ترقيتك إلى VIP! اضغط *📊 تقريري الآن* للبدء."
+                )
             except Exception:
                 pass
         except ValueError:
@@ -1072,9 +1149,6 @@ if __name__ == "__main__":
     log.info("🚀 تشغيل بوت مودل الأقصى…")
     init_db()
     refresh_rate()
-
-    # خيط الجدولة
     threading.Thread(target=_run_scheduler, daemon=True).start()
     log.info(f"⏰ جدولة التقارير كل {REPORT_INTERVAL_HOURS} ساعات")
-
     bot.infinity_polling(timeout=30, long_polling_timeout=20)
