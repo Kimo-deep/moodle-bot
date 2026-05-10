@@ -31,7 +31,7 @@ TOKEN = os.getenv("TOKEN")
 ENC_KEY = os.getenv("ENC_KEY")
 ADMIN_ID = 7840931571
 FREE_TRIAL_END = datetime(2026, 6, 1)
-DB_PATH = "users.db" # تم تعديل المسار ليعمل محلياً وسيرفر
+DB_PATH = "/app/data/users.db" # تم تعديل المسار ليعمل محلياً وسيرفر
 
 if not TOKEN or not ENC_KEY:
     raise ValueError("برجاء ضبط TOKEN و ENC_KEY في متغيرات البيئة")
