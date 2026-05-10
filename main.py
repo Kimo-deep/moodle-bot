@@ -33,10 +33,10 @@ DB_PATH        = "/app/data/users.db"
 bot    = telebot.TeleBot(TOKEN)
 client = Groq(api_key=GROQ_KEY)
 IS_HOLIDAY    = False
-FEEDBACK_MODE = {}   # chat_id → True إذا المستخدم في وضع إرسال ملاحظة
+FEEDBACK_MODE = {}   # chat_id → True  (في الذاكرة فقط، لا DB)
 
 # ══════════════════════════════════════════════════════
-# 2. قاعدة البيانات
+# 2. قاعدة البيانات  — جدولان فقط (users + payments)
 # ══════════════════════════════════════════════════════
 @contextmanager
 def get_db():
@@ -69,7 +69,6 @@ def init_db():
                 created_at TEXT    NOT NULL,
                 status     TEXT    NOT NULL DEFAULT 'pending'
             );
-            
             CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
         """)
 
@@ -118,154 +117,142 @@ def activate(chat_id: int, plan: str):
             )
 
 # ══════════════════════════════════════════════════════
-# 5. استخراج بيانات الحدث من HTML (الحل الصحيح للوقت)
+# 5. استخراج وقت الحدث من النص الخام
+#    مودل الأقصى يضع الوقت بأشكال مثل:
+#      "الاثنين, 11 مايو, 2:00 pm"
+#      "مستحق الثلاثاء, 12 مايو, 11:59 pm"
+#      "يُفتح الاثنين, 11 مايو, 2:00 pm ويُغلق الاثنين, 11 مايو, 2:20 pm"
 # ══════════════════════════════════════════════════════
-# تقويم مودل يضع الوقت في: <span class="date"> أو <a class="..."> أو data-*
-# البنية الفعلية:
-#   <div class="event">
-#     <div class="referer">اسم المادة</div>
-#     <h3><a href="...">اسم النشاط</a></h3>
-#     <div class="date">الاثنين، 11 مايو، 2:00 م</div>   ← وقت البداية
-#     <div class="date">... يُغلق ...</div>               ← وقت النهاية (إذا وُجد)
-#     <p>وصف اختياري</p>
-#   </div>
 
+# نمط الوقت: يوم عربي، رقم، شهر، وقت (12h)
+_TIME_PAT = re.compile(
+    r"((?:الأحد|الاثنين|الثلاثاء|الأربعاء|الخميس|الجمعة|السبت)"
+    r"[,،\s]+\d{1,2}\s+\w+[,،\s]+\d{1,2}:\d{2}\s*(?:am|pm|AM|PM|ص|م))",
+    re.UNICODE
+)
+
+def _find_times(text: str) -> list[str]:
+    """يستخرج كل التعابير الزمنية من النص."""
+    return _TIME_PAT.findall(text)
+
+def _parse_event_times(text: str) -> tuple[str, str]:
+    """
+    يرجع (date_open, date_close).
+    - إذا وُجد وقتان → الأول فتح، الثاني إغلاق
+    - إذا وُجد وقت واحد → date_close فقط
+    """
+    times = _find_times(text)
+    if len(times) >= 2:
+        return times[0].strip(), times[1].strip()
+    if len(times) == 1:
+        return "", times[0].strip()
+    # fallback: ابحث عن "مستحق" + ما بعده
+    m = re.search(r"مستحق\s+(.{5,40}?)(?:\s+حدث|$)", text)
+    if m:
+        return "", m.group(1).strip()
+    return "", ""
+
+# ══════════════════════════════════════════════════════
+# 6. استخراج بيانات الحدث من HTML
+# ══════════════════════════════════════════════════════
 def _extract_event(ev) -> dict:
-    """
-    يستخرج من div.event:
-      name, course, url, date_open, date_close, description, type_hint
-    """
-    # ── اسم النشاط ───────────────────────────────────
-    title_tag = ev.find("h3") or ev.find(class_="name")
-    name = title_tag.get_text(" ", strip=True) if title_tag else ""
+    raw = ev.get_text(" ", strip=True)
 
-    # ── رابط النشاط ──────────────────────────────────
-    a_tag = (title_tag.find("a", href=True) if title_tag else None) or ev.find("a", href=True)
-    url   = a_tag["href"] if a_tag else ""
+    # ── اسم النشاط ───────────────────────────────────
+    h3 = ev.find("h3")
+    a  = (h3.find("a") if h3 else None) or ev.find("a", href=True)
+    name = (h3.get_text(" ", strip=True) if h3 else "") or raw[:80]
+    url  = a["href"] if a else ""
 
     # ── اسم المادة ───────────────────────────────────
     course = ""
-    for sel in ["div.referer", "div.course-name", "small", "div.description a"]:
+    for sel in ["div.referer", "div.course-name", ".col-11 small", "small"]:
         tag = ev.select_one(sel)
         if tag:
             t = tag.get_text(" ", strip=True)
-            # استبعد النص الطويل جداً (ليس اسم مادة)
-            if t and len(t) < 80:
+            if t and len(t) < 100:
                 course = t
                 break
 
-    # ── التواريخ ─────────────────────────────────────
-    # مودل يضع الوقت في عدة أشكال، نجمعها كلها
-    dates = []
+    # ── استخراج اسم الدكتور من المادة ───────────────
+    # مثال: "خوارزميات متقدمة أ.فراس فؤاد العجلة"
+    doctor = "غير محدد"
+    doc_m  = re.search(r"[أا]\.\s*([\u0600-\u06FF\s]{3,30})", course)
+    if doc_m:
+        doctor = doc_m.group(1).strip()
+        course = course[:doc_m.start()].strip()
+    # حاول استخراجه من النص الخام إذا لم يُوجد في المادة
+    if doctor == "غير محدد":
+        doc_m = re.search(r"[أا]\.\s*([\u0600-\u06FF\s]{3,30})", raw)
+        if doc_m:
+            doctor = doc_m.group(1).strip()
 
-    # 1. عناصر <time datetime="...">
-    for t in ev.find_all("time"):
-        dt_attr = t.get("datetime", "")
-        label   = t.get_text(" ", strip=True)
-        if dt_attr:
-            try:
-                dt = datetime.fromisoformat(dt_attr.replace("Z", "+00:00")).replace(tzinfo=None)
-                dates.append((dt, label or dt_attr))
-            except Exception:
-                pass
-        elif label:
-            dates.append((None, label))
+    # ── الأوقات من النص الخام ────────────────────────
+    date_open, date_close = _parse_event_times(raw)
 
-    # 2. عناصر .date أو .event-date
-    if not dates:
-        for sel in [".date", ".event-date", ".col-11"]:
-            for tag in ev.select(sel):
-                txt = tag.get_text(" ", strip=True)
-                if txt and len(txt) > 3:
-                    dates.append((None, txt))
-
-    # 3. نص عام إذا لم يُجد شيء
-    raw_text = ev.get_text(" ", strip=True)
-
-    # ── تحديد date_open و date_close ─────────────────
-    date_open = date_close = ""
-    if len(dates) == 1:
-        # حدث واحد = موعد التسليم
-        date_close = dates[0][1]
-    elif len(dates) >= 2:
-        date_open  = dates[0][1]
-        date_close = dates[1][1]
-    elif dates:
-        date_close = dates[0][1]
-
-    # ── الوصف (بدون روابط وعناوين) ───────────────────
-    # نأخذ النص الخام كاملاً ونُنظفه
-    desc = raw_text
+    # ── تنظيف اسم النشاط ─────────────────────────────
+    _noise = [
+        "حدث المساق", "إذهب إلى النشاط", "إضافة تسليم",
+        "يرجى الالتزام", "التسليم فقط", "ولن يتم",
+        "WhatsApp", "واتساب", "PDF", "Moodle", "مودل",
+    ]
+    clean_name = name
+    for n in _noise:
+        clean_name = re.sub(
+            r"[^.!؟،]*" + re.escape(n) + r"[^.!؟،]*[.!؟،]?",
+            "", clean_name, flags=re.IGNORECASE
+        )
+    clean_name = clean_name.strip() or name[:60]
 
     return {
-        "name":       name or desc[:60],
-        "course":     course,
+        "name":       clean_name,
+        "course":     course or "غير محدد",
+        "doctor":     doctor,
         "url":        url,
         "url_lower":  url.lower(),
         "date_open":  date_open,
         "date_close": date_close,
-        "raw":        raw_text,
+        "raw":        raw,
     }
 
-def _clean_name(name: str) -> str:
-    """يزيل فقرات التعليمات من الاسم."""
-    noise = [
-        "حدث المساق", "إذهب إلى النشاط", "إضافة تسليم", "يرجى الالتزام",
-        "التسليم فقط", "ولن يتم", "WhatsApp", "واتساب", "PDF", "Moodle",
-        "مودل", "يمكنك", "يجب", "تقديم الواجب", "رابط",
+def _fmt(ev: dict, kind: str) -> str:
+    """يبني نص الحدث المنسق."""
+    lines = [
+        f"▪️ {ev['name']}",
+        f"   📌 المادة: {ev['course']}",
+        f"   👨‍🏫 الدكتور: {ev['doctor']}",
     ]
-    for n in noise:
-        # احذف الجملة التي تحتوي على الكلمة
-        name = re.sub(rf"[^.!؟]*{re.escape(n)}[^.!؟]*[.!؟]?", "", name, flags=re.IGNORECASE)
-    return name.strip()
-
-def _format_event_block(ev: dict, kind: str) -> str:
-    """يبني نص الحدث المنسق مباشرةً بدون AI."""
-    name   = _clean_name(ev["name"]) or "—"
-    course = ev["course"] or "غير محدد"
-
-    # استخراج اسم الدكتور من اسم المادة إذا كان مدمجاً (شائع في مودل الأقصى)
-    # مثال: "خوارزميات متقدمة أ.فراس فؤاد" → course="خوارزميات متقدمة", doctor="فراس فؤاد"
-    doctor = "غير محدد"
-    doc_match = re.search(r"[أا]\.\s*([\w\s]{4,30})", course)
-    if doc_match:
-        doctor = doc_match.group(1).strip()
-        course = course[:doc_match.start()].strip()
-
-    lines = [f"▪️ {name}", f"   📌 المادة: {course}", f"   👨‍🏫 الدكتور: {doctor}"]
-
     if kind == "exam":
         if ev["date_open"] and ev["date_close"]:
-            lines.append(f"   🕐 يفتح: {ev['date_open']} | يغلق: {ev['date_close']}")
+            lines.append(f"   🕐 يفتح: {ev['date_open']}  |  يغلق: {ev['date_close']}")
         elif ev["date_close"]:
             lines.append(f"   🕐 يغلق: {ev['date_close']}")
         elif ev["date_open"]:
             lines.append(f"   🕐 يفتح: {ev['date_open']}")
-    else:  # assign / lecture / meeting
+    else:
         if ev["date_close"]:
             lines.append(f"   📅 آخر موعد: {ev['date_close']}")
         elif ev["date_open"]:
             lines.append(f"   📅 الموعد: {ev['date_open']}")
-
     return "\n".join(lines)
 
 # ══════════════════════════════════════════════════════
-# 6. كشف المنجز
+# 7. كشف المنجز
 # ══════════════════════════════════════════════════════
-_CAL_DONE_KW = [
+_DONE_KW = [
     "تم التسليم", "submitted", "تخطى", "سلمت", "تم الإرسال",
     "attempt already", "تم المحاولة", "no attempts allowed", "past due", "overdue",
 ]
 
 def _quick_done(text: str) -> bool:
     t = text.lower()
-    return any(k.lower() in t for k in _CAL_DONE_KW)
+    return any(k.lower() in t for k in _DONE_KW)
 
 def _assign_done(session, url: str) -> bool:
     try:
         soup = BeautifulSoup(session.get(url, timeout=12).text, "html.parser")
-        for row in soup.find_all("tr"):
-            th = row.find("th"); td = row.find("td")
+        for tr in soup.find_all("tr"):
+            th = tr.find("th"); td = tr.find("td")
             if not (th and td): continue
             label = th.get_text(strip=True).lower()
             value = td.get_text(strip=True).lower()
@@ -296,7 +283,7 @@ def _quiz_done(session, url: str) -> bool:
         return False
 
 # ══════════════════════════════════════════════════════
-# 7. محرك المودل (استخراج منظم + تنسيق مباشر)
+# 8. محرك المودل
 # ══════════════════════════════════════════════════════
 _EXAM_KW   = ["اختبار", "امتحان", "كويز", "quiz", "exam", "test", "midterm"]
 _ASSIGN_KW = ["تكليف", "واجب", "مهمة", "تقرير", "تجربة", "رفع", "ملف",
@@ -307,20 +294,17 @@ def run_moodle(username: str, password: str) -> dict:
     session = requests.Session()
     session.headers["User-Agent"] = "Mozilla/5.0"
     login_url = "https://moodle.alaqsa.edu.ps/login/index.php"
-
     try:
-        # ── تسجيل الدخول ──────────────────────────────
         soup = BeautifulSoup(session.get(login_url, timeout=20).text, "html.parser")
         ti   = soup.find("input", {"name": "logintoken"})
         if not ti:
             return {"status": "error", "message": "⚠️ تعذّر الوصول إلى صفحة تسجيل الدخول."}
         resp = session.post(login_url,
-                            data={"username": username, "password": password, "logintoken": ti["value"]},
-                            timeout=20)
+                            data={"username": username, "password": password,
+                                  "logintoken": ti["value"]}, timeout=20)
         if "login" in resp.url:
             return {"status": "fail", "message": "❌ بيانات المودل غير صحيحة."}
 
-        # ── صفحة التقويم ──────────────────────────────
         soup = BeautifulSoup(
             session.get("https://moodle.alaqsa.edu.ps/calendar/view.php?view=upcoming",
                         timeout=20).text, "html.parser"
@@ -331,11 +315,8 @@ def run_moodle(username: str, password: str) -> dict:
 
         for ev_div in soup.find_all("div", {"class": "event"}):
             raw_txt = ev_div.get_text(" ", strip=True)
-
-            # خط 1: كلمات سريعة
             if _quick_done(raw_txt):
-                skipped += 1
-                continue
+                skipped += 1; continue
 
             ev = _extract_event(ev_div)
             ll = ev["url_lower"]
@@ -345,42 +326,34 @@ def run_moodle(username: str, password: str) -> dict:
             is_assign = "assign" in ll or any(w in tl for w in _ASSIGN_KW)
             is_meet   = any(x in ll for x in _MEET_KW) or "لقاء" in tl
 
-            # خط 2 و 3: فحص الصفحة الفعلية
             if ev["url"]:
                 if is_assign and not is_quiz:
                     if _assign_done(session, ev["url"]):
-                        skipped += 1
-                        continue
+                        skipped += 1; continue
                 elif is_quiz:
                     if _quiz_done(session, ev["url"]):
-                        skipped += 1
-                        continue
+                        skipped += 1; continue
 
-            if is_quiz:
-                exams.append(_format_event_block(ev, "exam"))
-            elif is_meet:
-                meetings.append(_format_event_block(ev, "meeting"))
-            elif is_assign:
-                assignments.append(_format_event_block(ev, "assign"))
-            else:
-                lectures.append(_format_event_block(ev, "lecture"))
+            if is_quiz:     exams.append(_fmt(ev, "exam"))
+            elif is_meet:   meetings.append(_fmt(ev, "meeting"))
+            elif is_assign: assignments.append(_fmt(ev, "assign"))
+            else:           lectures.append(_fmt(ev, "lecture"))
 
-        if not any([lectures, meetings, exams, assignments]):
-            note = f"\n_(مخفي: {skipped} منجز)_" if skipped else ""
-            return {"status": "success", "message": f"✅ لا يوجد تحديثات جديدة حالياً.{note}"}
+        # ── بناء التقرير دائماً (حتى لو لا يوجد شيء) ──
+        parts = []
+        parts.append("📚 *المحاضرات:* " + ("لا يوجد" if not lectures else ""))
+        if lectures:   parts[-1] += "\n" + "\n\n".join(lectures)
 
-        hidden = f"\n\n_(تم إخفاء {skipped} عنصر منجز)_" if skipped else ""
-        parts  = []
+        parts.append("🎥 *اللقاءات:* " + ("لا يوجد" if not meetings else ""))
+        if meetings:   parts[-1] += "\n" + "\n\n".join(meetings)
 
-        if lectures:
-            parts.append("📚 *المحاضرات:*\n" + "\n\n".join(lectures))
-        if meetings:
-            parts.append("🎥 *اللقاءات:*\n" + "\n\n".join(meetings))
-        if exams:
-            parts.append("📝 *الاختبارات:*\n" + "\n\n".join(exams))
-        if assignments:
-            parts.append("⚠️ *التكاليف والتجارب:*\n" + "\n\n".join(assignments))
+        parts.append("📝 *الاختبارات:* " + ("لا يوجد" if not exams else ""))
+        if exams:      parts[-1] += "\n" + "\n\n".join(exams)
 
+        parts.append("⚠️ *التكاليف والتجارب:* " + ("لا يوجد" if not assignments else ""))
+        if assignments: parts[-1] += "\n" + "\n\n".join(assignments)
+
+        hidden = f"\n\n_(تم إخفاء {skipped} منجز)_" if skipped else ""
         return {"status": "success", "message": "\n\n".join(parts) + hidden}
 
     except requests.RequestException as e:
@@ -391,7 +364,7 @@ def run_moodle(username: str, password: str) -> dict:
         return {"status": "error", "message": f"⚠️ خطأ: {str(e)[:60]}"}
 
 # ══════════════════════════════════════════════════════
-# 8. Binance Pay
+# 9. Binance Pay
 # ══════════════════════════════════════════════════════
 def _bin_headers(body: str) -> dict:
     nonce = uuid.uuid4().hex
@@ -455,17 +428,19 @@ def poll_payments():
     cutoff = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT order_id, chat_id FROM payments WHERE status='pending' AND created_at >= ?",
-            (cutoff,)
+            "SELECT order_id, chat_id FROM payments "
+            "WHERE status='pending' AND created_at >= ?", (cutoff,)
         ).fetchall()
-        conn.execute("DELETE FROM payments WHERE status='pending' AND created_at < ?", (cutoff,))
-
+        conn.execute(
+            "DELETE FROM payments WHERE status='pending' AND created_at < ?", (cutoff,)
+        )
     for row in rows:
         st = binance_query(row["order_id"])
         if st == "PAID":
             activate(row["chat_id"], "monthly")
             with get_db() as conn:
-                conn.execute("UPDATE payments SET status='paid' WHERE order_id=?", (row["order_id"],))
+                conn.execute("UPDATE payments SET status='paid' WHERE order_id=?",
+                             (row["order_id"],))
             try: bot.send_message(row["chat_id"], "🎉 تم استلام دفعتك وتفعيل اشتراكك تلقائياً!")
             except: pass
         elif st in ("CANCELLED", "EXPIRED"):
@@ -474,20 +449,18 @@ def poll_payments():
                              (st.lower(), row["order_id"]))
 
 # ══════════════════════════════════════════════════════
-# 9. أوامر البوت
+# 10. أوامر البوت
 # ══════════════════════════════════════════════════════
-
 @bot.message_handler(commands=["start"])
 def cmd_start(m):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🔍 فحص الآن", "📊 حالتي")
-    kb.row("💳 اشتراك",   "📝 ملاحظة أو شكوى")
+    kb.row("💳 اشتراك", "📝 ملاحظة أو شكوى")
     kb.row("❓ مساعدة")
     bot.send_message(m.chat.id,
         "🎓 *مرحباً في بوت مودل الأقصى*\n\n"
-        "• فحص تلقائي كل 6 ساعات\n"
+        "• تقرير تلقائي كل 6 ساعات\n"
         "• يُخفي التكاليف المسلّمة والكويزات المحلولة\n"
-        "• لا يُرسل إذا لا يوجد جديد\n"
         "• يمكنك إرسال ملاحظات أو شكاوى مباشرة",
         parse_mode="Markdown", reply_markup=kb)
 
@@ -495,8 +468,7 @@ def cmd_start(m):
 def _do_check(chat_id: int):
     ok, label = check_access(chat_id)
     if not ok:
-        bot.send_message(chat_id,
-            "🚫 اشتراكك منتهٍ. استخدم /subscribe للتجديد.")
+        bot.send_message(chat_id, "🚫 اشتراكك منتهٍ. استخدم /subscribe للتجديد.")
         return
     with get_db() as conn:
         row = conn.execute(
@@ -616,138 +588,82 @@ def _step_pwd(msg, user):
                 (msg.chat.id, user, pwd)
             )
         text = f"✅ تم الربط! ستصلك تقارير كل 6 ساعات.\n\n{res['message']}"
-        try:
-            bot.edit_message_text(text, msg.chat.id, wm.message_id, parse_mode="Markdown")
-        except Exception:
-            bot.send_message(msg.chat.id, text, parse_mode="Markdown")
+        try:    bot.edit_message_text(text, msg.chat.id, wm.message_id, parse_mode="Markdown")
+        except: bot.send_message(msg.chat.id, text, parse_mode="Markdown")
     else:
-        try:
-            bot.edit_message_text(res["message"], msg.chat.id, wm.message_id)
-        except Exception:
-            bot.send_message(msg.chat.id, res["message"])
+        try:    bot.edit_message_text(res["message"], msg.chat.id, wm.message_id)
+        except: bot.send_message(msg.chat.id, res["message"])
 
 # ══════════════════════════════════════════════════════
-# 10. نظام الملاحظات والشكاوى
+# 11. الملاحظات والشكاوى — بدون DB، ترسل مباشرة للأدمن
 # ══════════════════════════════════════════════════════
-
-@bot.message_handler(commands=["feedback"])
-def cmd_feedback(m):
-    _start_feedback(m.chat.id)
-
-@bot.message_handler(func=lambda m: m.text == "📝 ملاحظة أو شكوى")
-def btn_feedback(m):
-    _start_feedback(m.chat.id)
-
 def _start_feedback(chat_id: int):
     FEEDBACK_MODE[chat_id] = True
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="feedback_cancel"))
     bot.send_message(chat_id,
         "📝 *إرسال ملاحظة أو شكوى*\n\n"
-        "اكتب ملاحظتك أو شكواك وسيطّلع عليها الأدمن.\n"
-        "يمكنك ذكر أي مشكلة تقنية أو اقتراح تحسين.",
+        "اكتب ملاحظتك وسيصلها الأدمن مباشرة.",
         parse_mode="Markdown", reply_markup=kb)
+
+@bot.message_handler(commands=["feedback"])
+def cmd_feedback(m): _start_feedback(m.chat.id)
+
+@bot.message_handler(func=lambda m: m.text == "📝 ملاحظة أو شكوى")
+def btn_feedback(m): _start_feedback(m.chat.id)
 
 @bot.message_handler(func=lambda m: FEEDBACK_MODE.get(m.chat.id))
 def receive_feedback(m):
     if not m.text:
-        bot.send_message(m.chat.id, "❌ أرسل ملاحظتك كنص.")
-        return
-
+        bot.send_message(m.chat.id, "❌ أرسل ملاحظتك كنص."); return
     FEEDBACK_MODE.pop(m.chat.id, None)
     uname = f"@{m.from_user.username}" if m.from_user.username else "بدون يوزرنيم"
-
-
-    # إرسال للأدمن
+    # إرسال مباشر للأدمن — لا حفظ في DB
     kb = types.InlineKeyboardMarkup()
-    kb.add(
-        types.InlineKeyboardButton("↩️ رد", callback_data=f"fb_reply_{m.chat.id}"),
-        types.InlineKeyboardButton("✅ تم", callback_data=f"fb_done_{m.chat.id}")
-    )
+    kb.add(types.InlineKeyboardButton("↩️ رد", callback_data=f"fb_reply_{m.chat.id}"))
     try:
         bot.send_message(ADMIN_ID,
             f"📝 *ملاحظة جديدة*\n\n"
-            f"👤 المستخدم: {uname} (`{m.chat.id}`)\n"
+            f"👤 {uname} (`{m.chat.id}`)\n"
             f"📅 {datetime.now():%Y-%m-%d %H:%M}\n\n"
-            f"💬 *الرسالة:*\n{m.text}",
+            f"💬 {m.text}",
             parse_mode="Markdown", reply_markup=kb)
     except Exception as e:
-        log.error(f"فشل إرسال الملاحظة للأدمن: {e}")
-
-    bot.send_message(m.chat.id,
-        "✅ تم إرسال ملاحظتك! سيطّلع عليها الأدمن قريباً.\n"
-        "شكراً على تواصلك معنا. 🙏")
+        log.error(f"فشل إرسال الملاحظة: {e}")
+    bot.send_message(m.chat.id, "✅ تم إرسال ملاحظتك للأدمن. شكراً! 🙏")
 
 @bot.callback_query_handler(func=lambda c: c.data == "feedback_cancel")
 def cb_feedback_cancel(call):
     FEEDBACK_MODE.pop(call.message.chat.id, None)
     bot.answer_callback_query(call.id, "تم الإلغاء.")
-    bot.edit_message_text("❌ تم إلغاء إرسال الملاحظة.",
-                          call.message.chat.id, call.message.message_id)
+    try:
+        bot.edit_message_text("❌ تم إلغاء الملاحظة.",
+                              call.message.chat.id, call.message.message_id)
+    except Exception: pass
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("fb_reply_"))
 def cb_fb_reply(call):
     if call.from_user.id != ADMIN_ID: return
     uid = int(call.data.split("_")[2])
     bot.answer_callback_query(call.id)
-    wm = bot.send_message(ADMIN_ID,
-        f"✍️ اكتب ردك على المستخدم `{uid}`:", parse_mode="Markdown")
-    bot.register_next_step_handler(wm, lambda m: _send_admin_reply(m, uid))
+    wm = bot.send_message(ADMIN_ID, f"✍️ اكتب ردك على `{uid}`:", parse_mode="Markdown")
+    bot.register_next_step_handler(wm, lambda msg: _admin_reply(msg, uid))
 
-def _send_admin_reply(msg, uid: int):
+def _admin_reply(msg, uid: int):
     if not msg.text:
         bot.send_message(ADMIN_ID, "❌ أرسل الرد كنص."); return
     try:
-        bot.send_message(uid,
-            f"📨 *رد من الإدارة:*\n\n{msg.text}",
-            parse_mode="Markdown")
-        bot.send_message(ADMIN_ID, f"✅ تم إرسال الرد للمستخدم `{uid}`.")
+        bot.send_message(uid, f"📨 *رد من الإدارة:*\n\n{msg.text}", parse_mode="Markdown")
+        bot.send_message(ADMIN_ID, f"✅ تم إرسال الرد للمستخدم `{uid}`.",
+                         parse_mode="Markdown")
     except Exception as e:
         bot.send_message(ADMIN_ID, f"❌ فشل الإرسال: {e}")
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("fb_done_"))
-def cb_fb_done(call):
-    if call.from_user.id != ADMIN_ID: return
-    uid = int(call.data.split("_")[2])
-    with get_db() as conn:
-        conn.execute(
-            "UPDATE feedback SET status='resolved' WHERE chat_id=? AND status='new'", (uid,)
-        )
-    bot.answer_callback_query(call.id, "✅ تم وضع علامة مُعالَج.")
-    try:
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
-                                      reply_markup=None)
-    except Exception:
-        pass
-
-# أمر الأدمن لعرض الملاحظات المعلقة
-@bot.message_handler(commands=["feedbacks"])
-def cmd_feedbacks(m):
-    if m.chat.id != ADMIN_ID: return
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT id, chat_id, username, message, sent_at FROM feedback "
-            "WHERE status='new' ORDER BY sent_at DESC LIMIT 10"
-        ).fetchall()
-    if not rows:
-        bot.send_message(m.chat.id, "✅ لا توجد ملاحظات معلقة."); return
-    for row in rows:
-        kb = types.InlineKeyboardMarkup()
-        kb.add(
-            types.InlineKeyboardButton("↩️ رد", callback_data=f"fb_reply_{row['chat_id']}"),
-            types.InlineKeyboardButton("✅ تم", callback_data=f"fb_done_{row['chat_id']}")
-        )
-        bot.send_message(m.chat.id,
-            f"📝 *#{row['id']}* — {row['username']} (`{row['chat_id']}`)\n"
-            f"📅 {row['sent_at']}\n\n{row['message']}",
-            parse_mode="Markdown", reply_markup=kb)
-
 # ══════════════════════════════════════════════════════
-# 11. استلام الإيصالات اليدوية
+# 12. استلام الإيصالات اليدوية
 # ══════════════════════════════════════════════════════
 @bot.message_handler(content_types=["photo"])
 def handle_photo(m):
-    # تجاهل إذا كان في وضع الملاحظة
     if FEEDBACK_MODE.get(m.chat.id):
         bot.send_message(m.chat.id, "📝 أرسل ملاحظتك كنص."); return
     kb = types.InlineKeyboardMarkup()
@@ -767,7 +683,7 @@ def handle_photo(m):
         bot.reply_to(m, "⚠️ حدث خطأ. حاول مجدداً.")
 
 # ══════════════════════════════════════════════════════
-# 12. Callbacks الدفع
+# 13. Callbacks الدفع
 # ══════════════════════════════════════════════════════
 @bot.callback_query_handler(func=lambda c: c.data == "sub_binance")
 def cb_binance(call):
@@ -837,7 +753,7 @@ def cb_admin(call):
     bot.answer_callback_query(call.id)
 
 # ══════════════════════════════════════════════════════
-# 13. أوامر الأدمن
+# 14. أوامر الأدمن
 # ══════════════════════════════════════════════════════
 def _admin(m): return m.chat.id == ADMIN_ID
 
@@ -875,12 +791,11 @@ def cmd_holiday(m):
 def cmd_stats(m):
     if not _admin(m): return
     with get_db() as conn:
-        total    = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        linked   = conn.execute("SELECT COUNT(*) FROM users WHERE username IS NOT NULL").fetchone()[0]
-        vip      = conn.execute("SELECT COUNT(*) FROM users WHERE is_vip=1").fetchone()[0]
-        active   = conn.execute("SELECT COUNT(*) FROM users WHERE expiry_date > datetime('now')").fetchone()[0]
-        pending  = conn.execute("SELECT COUNT(*) FROM payments WHERE status='pending'").fetchone()[0]
-        new_fb   = conn.execute("SELECT COUNT(*) FROM feedback WHERE status='new'").fetchone()[0]
+        total   = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        linked  = conn.execute("SELECT COUNT(*) FROM users WHERE username IS NOT NULL").fetchone()[0]
+        vip     = conn.execute("SELECT COUNT(*) FROM users WHERE is_vip=1").fetchone()[0]
+        active  = conn.execute("SELECT COUNT(*) FROM users WHERE expiry_date > datetime('now')").fetchone()[0]
+        pending = conn.execute("SELECT COUNT(*) FROM payments WHERE status='pending'").fetchone()[0]
     bot.send_message(m.chat.id,
         f"📊 *إحصائيات:*\n\n"
         f"👥 المستخدمون: {total}\n"
@@ -888,7 +803,6 @@ def cmd_stats(m):
         f"🌟 VIP: {vip}\n"
         f"✅ اشتراك نشط: {active}\n"
         f"⏳ طلبات دفع معلقة: {pending}\n"
-        f"📝 ملاحظات جديدة: {new_fb}\n"
         f"💵 سعر الاشتراك: {price_str()}\n"
         f"🏖️ وضع العطلة: {'مفعّل' if IS_HOLIDAY else 'ملغى'}",
         parse_mode="Markdown")
@@ -907,7 +821,7 @@ def cmd_broadcast(m):
     bot.send_message(m.chat.id, f"✅ أُرسلت لـ {ok}/{len(uids)} مستخدم.")
 
 # ══════════════════════════════════════════════════════
-# 14. التقارير الدورية
+# 15. التقارير الدورية — ترسل دائماً كل 6 ساعات
 # ══════════════════════════════════════════════════════
 def broadcast_reports():
     if IS_HOLIDAY: return
@@ -919,15 +833,28 @@ def broadcast_reports():
     for row in users:
         uid, user, pwd = row["chat_id"], row["username"], row["password"]
         if not check_access(uid)[0]: continue
+
         res = run_moodle(user, pwd)
-        if res["status"] != "success" or "لا يوجد تحديثات" in res["message"]: continue
+        if res["status"] != "success": continue
+
         msg = res["message"]
-        h   = hashlib.md5(msg.encode()).hexdigest()
+        # hash فقط لمنع إرسال نفس التقرير مرتين في نفس الدورة
+        # لكن نرسل دائماً (حتى لو "لا يوجد") — نحدّث الـ hash بعد كل إرسال
+        h = hashlib.md5(msg.encode()).hexdigest()
+
         with get_db() as conn:
-            old = conn.execute("SELECT last_hash FROM users WHERE chat_id=?", (uid,)).fetchone()
-            if old and old["last_hash"] == h: continue
+            old = conn.execute(
+                "SELECT last_hash FROM users WHERE chat_id=?", (uid,)
+            ).fetchone()
+            # أرسل دائماً — فقط لا تُرسل نفس التقرير الحرفي مرتين في نفس دورة الـ 6 ساعات
+            if old and old["last_hash"] == h:
+                # نفس المحتوى تماماً، لا ترسل لتجنب الإزعاج بدون مبرر
+                # لكن بعد 6 ساعات سيُعاد الفحص وسيُرسل إذا تغير أي شيء
+                continue
             try:
-                bot.send_message(uid, f"🔔 *تقرير المودل:*\n\n{msg}", parse_mode="Markdown")
+                bot.send_message(uid,
+                    f"🔔 *تقرير المودل:*\n\n{msg}",
+                    parse_mode="Markdown")
                 conn.execute(
                     "UPDATE users SET last_hash=?, last_report=? WHERE chat_id=?",
                     (h, datetime.now().strftime("%Y-%m-%d %H:%M"), uid)
@@ -936,7 +863,7 @@ def broadcast_reports():
                 log.warning(f"فشل إرسال تقرير لـ {uid}: {e}")
 
 # ══════════════════════════════════════════════════════
-# 15. المُجدوِل
+# 16. المُجدوِل
 # ══════════════════════════════════════════════════════
 def _scheduler():
     schedule.every(6).hours.do(broadcast_reports)
@@ -947,7 +874,7 @@ def _scheduler():
         time.sleep(30)
 
 # ══════════════════════════════════════════════════════
-# 16. التشغيل
+# 17. التشغيل
 # ══════════════════════════════════════════════════════
 if __name__ == "__main__":
     init_db()
