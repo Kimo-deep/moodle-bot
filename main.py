@@ -45,7 +45,7 @@ ADMIN_ID = 7840931571
 
 FREE_TRIAL_END = datetime(2026, 6, 1)
 
-DB_PATH = "users.db"
+DB_PATH = "/app/data/users.db"
 
 CACHE = {}
 CACHE_TTL = 300
