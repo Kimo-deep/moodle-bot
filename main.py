@@ -1,1126 +1,286 @@
 # -*- coding: utf-8 -*-
-
 import os
 import re
 import time
-import queue
 import hashlib
 import logging
 import sqlite3
 import threading
-
 from datetime import datetime, timedelta
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import telebot
 import schedule
-
 from bs4 import BeautifulSoup
 from cryptography.fernet import Fernet
 from requests.adapters import HTTPAdapter
 from telebot import types
 
 # =====================================================
-# الإعدادات
+# الإعدادات المتقدمة
 # =====================================================
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
-
 log = logging.getLogger(__name__)
 
 TOKEN = os.getenv("TOKEN")
 ENC_KEY = os.getenv("ENC_KEY")
-
-if not TOKEN:
-    raise ValueError("TOKEN missing")
-
-if not ENC_KEY:
-    raise ValueError("ENC_KEY missing")
-
 ADMIN_ID = 7840931571
-
 FREE_TRIAL_END = datetime(2026, 6, 1)
+DB_PATH = "users.db" # تم تعديل المسار ليعمل محلياً وسيرفر
 
-DB_PATH = "/app/data/users.db"
+if not TOKEN or not ENC_KEY:
+    raise ValueError("برجاء ضبط TOKEN و ENC_KEY في متغيرات البيئة")
 
-CACHE = {}
-CACHE_TTL = 300
+try:
+    fernet = Fernet(ENC_KEY.encode())
+except Exception as e:
+    log.error(f"خطأ في مفتاح التشفير: {e}")
+    raise
 
-fernet = Fernet(ENC_KEY.encode())
-
-bot = telebot.TeleBot(TOKEN)
-
+bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 DB_LOCK = threading.Lock()
-
-IS_HOLIDAY = False
+CACHE = {}
+CACHE_TTL = 600 # 10 دقائق
 
 # =====================================================
-# قاعدة البيانات
+# قاعدة البيانات المطورة
 # =====================================================
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-DB_CONN = sqlite3.connect(
-    DB_PATH,
-    check_same_thread=False,
-    timeout=30
-)
-
-DB_CONN.row_factory = sqlite3.Row
-
+DB_CONN = get_db_connection()
 
 @contextmanager
 def get_db():
-
     with DB_LOCK:
-
         try:
-
             yield DB_CONN
-
             DB_CONN.commit()
-
-        except:
-
+        except Exception as e:
             DB_CONN.rollback()
-
+            log.error(f"Database Error: {e}")
             raise
 
-
 def init_db():
-
     with get_db() as conn:
-
         conn.executescript("""
-
         CREATE TABLE IF NOT EXISTS users (
-
             chat_id INTEGER PRIMARY KEY,
-
             username TEXT,
-
             password TEXT,
-
             expiry_date TEXT,
-
             is_vip INTEGER DEFAULT 0,
-
             last_hash TEXT,
-
-            last_report TEXT
-
+            last_report TEXT,
+            joined_at TEXT
         );
-
         """)
 
 # =====================================================
-# أدوات
+# أدوات الحماية والتنسيق
 # =====================================================
-
-
 def enc(txt):
-
     return fernet.encrypt(txt.encode()).decode()
 
-
 def dec(txt):
-
-    return fernet.decrypt(txt.encode()).decode()
-
+    try:
+        return fernet.decrypt(txt.encode()).decode()
+    except:
+        return None
 
 def esc(text):
-
-    if not text:
-        return ""
-
+    if not text: return ""
     chars = r"_*[]()~`>#+-=|{}.!"
-
     for c in chars:
-
         text = text.replace(c, f"\\{c}")
-
     return text
 
-
-def get_cached_report(username):
-
-    item = CACHE.get(username)
-
-    if not item:
-        return None
-
-    ts, data = item
-
-    if time.time() - ts > CACHE_TTL:
-
-        del CACHE[username]
-
-        return None
-
-    return data
-
-
-def set_cached_report(username, data):
-
-    CACHE[username] = (time.time(), data)
-
-
 # =====================================================
-# الكلمات الدلالية
+# منطق فحص المودل (محسن)
 # =====================================================
-
-_DONE_KW = [
-
-    "تم التسليم",
-    "submitted",
-    "graded",
-    "review attempt",
-    "finished",
-    "completed",
-    "attempt",
-    "تمت المحاولة",
-    "تم الحل"
-
-]
-
-_EXAM_KW = [
-
-    "اختبار",
-    "امتحان",
-    "quiz",
-    "exam",
-    "test"
-
-]
-
-_ASSIGN_KW = [
-
-    "تكليف",
-    "واجب",
-    "assignment",
-    "task",
-    "report"
-
-]
-
-_MEET_KW = [
-
-    "zoom",
-    "meet",
-    "bigbluebutton"
-
-]
-
-# =====================================================
-# كشف المنجز
-# =====================================================
-
-
-def _quick_done(text):
-
-    t = text.lower().strip()
-
-    return any(k.lower() in t for k in _DONE_KW)
-
-
-def _assign_done(session, url):
-
-    try:
-
-        soup = BeautifulSoup(
-
-            session.get(url, timeout=15).text,
-
-            "html.parser"
-
-        )
-
-        page = soup.get_text(" ", strip=True).lower()
-
-        done_words = [
-
-            "submitted",
-            "edit submission",
-            "تم التسليم",
-            "graded"
-
-        ]
-
-        return any(w in page for w in done_words)
-
-    except:
-
-        return False
-
-
-def _quiz_done(session, url):
-
-    try:
-
-        soup = BeautifulSoup(
-
-            session.get(url, timeout=15).text,
-
-            "html.parser"
-
-        )
-
-        page = soup.get_text(" ", strip=True).lower()
-
-        done = [
-
-            "review attempt",
-            "finished",
-            "your final grade",
-            "تم الحل"
-
-        ]
-
-        return any(w in page for w in done)
-
-    except:
-
-        return False
-
-# =====================================================
-# استخراج الوقت
-# =====================================================
-
-
-def _extract_time_from_div(ev):
-
-    time_tag = ev.find("time")
-
-    if time_tag:
-
-        dt = (
-
-            time_tag.get("datetime")
-
-            or time_tag.get("data-time")
-
-            or ""
-
-        ).strip()
-
-        if dt:
-
-            try:
-
-                parsed = datetime.fromisoformat(
-
-                    dt.replace("Z", "+00:00")
-
-                )
-
-                parsed += timedelta(hours=3)
-
-                return parsed.strftime("%Y-%m-%d %I:%M %p")
-
-            except:
-                pass
-
-    text = ev.get_text(" ", strip=True)
-
-    m = re.search(r"\d{1,2}:\d{2}", text)
-
-    if m:
-        return m.group(0)
-
-    return ""
-
-# =====================================================
-# استخراج النشاط
-# =====================================================
-
-
-def _extract_event(ev):
-
-    h3 = ev.find("h3")
-
-    atag = ev.find("a", href=True)
-
-    name = h3.get_text(" ", strip=True) if h3 else "نشاط"
-
-    url = atag["href"] if atag else ""
-
-    course = "غير محدد"
-
-    desc = ev.find(class_="description")
-
-    if desc:
-
-        course = desc.get_text(" ", strip=True)
-
-    return {
-
-        "name": esc(name),
-
-        "course": esc(course),
-
-        "url": url,
-
-        "url_lower": url.lower(),
-
-        "time": _extract_time_from_div(ev),
-
-        "raw": ev.get_text(" ", strip=True),
-
-    }
-
-# =====================================================
-# تنسيق الرسائل
-# =====================================================
-
-
-def _fmt_exam(ev):
-
-    return (
-
-        f"▪️ *{ev['name']}*\n"
-
-        f"📌 {ev['course']}\n"
-
-        f"🕐 {ev['time']}"
-
-    )
-
-
-def _fmt_task(ev):
-
-    return (
-
-        f"▪️ *{ev['name']}*\n"
-
-        f"📌 {ev['course']}\n"
-
-        f"📅 {ev['time']}"
-
-    )
-
-# =====================================================
-# مودل
-# =====================================================
-
-
 def run_moodle(username, password):
-
-    cached = get_cached_report(username)
-
-    if cached:
-        return cached
+    # فحص الكاش أولاً لتوفير الموارد
+    if username in CACHE:
+        ts, data = CACHE[username]
+        if time.time() - ts < CACHE_TTL:
+            return data
 
     session = requests.Session()
-
-    adapter = HTTPAdapter(
-
-        pool_connections=20,
-
-        pool_maxsize=20,
-
-        max_retries=2
-
-    )
-
-    session.mount("https://", adapter)
-
-    session.headers.update({
-
-        "User-Agent": "Mozilla/5.0"
-
-    })
-
-    login_url = "https://moodle.alaqsa.edu.ps/login/index.php"
+    session.mount("https://", HTTPAdapter(max_retries=3))
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
 
     try:
-
-        soup = BeautifulSoup(
-
-            session.get(login_url, timeout=20).text,
-
-            "html.parser"
-
-        )
-
-        token = soup.find(
-
-            "input",
-
-            {"name": "logintoken"}
-
-        )
-
+        login_page = session.get("https://moodle.alaqsa.edu.ps/login/index.php", timeout=15)
+        soup = BeautifulSoup(login_page.text, "html.parser")
+        token = soup.find("input", {"name": "logintoken"})
+        
         if not token:
+            return {"status": "error", "message": "⚠️ عذراً، موقع المودل لا يستجيب حالياً."}
 
-            return {
-
-                "status": "error",
-
-                "message": "تعذر فتح صفحة تسجيل الدخول"
-
-            }
-
-        resp = session.post(
-
-            login_url,
-
-            data={
-
-                "username": username,
-
-                "password": password,
-
-                "logintoken": token["value"]
-
-            },
-
-            timeout=20
-
+        login_resp = session.post(
+            "https://moodle.alaqsa.edu.ps/login/index.php",
+            data={"username": username, "password": password, "logintoken": token["value"]},
+            timeout=15
         )
 
-        if "login" in resp.url:
+        if "login" in login_resp.url:
+            return {"status": "fail", "message": "❌ الرقم الجامعي أو كلمة المرور غير صحيحة."}
 
-            return {
-
-                "status": "fail",
-
-                "message": "❌ بيانات الدخول غير صحيحة"
-
-            }
-
-        calendar = session.get(
-
-            "https://moodle.alaqsa.edu.ps/calendar/view.php?view=upcoming",
-
-            timeout=20
-
-        )
-
-        soup = BeautifulSoup(
-
-            calendar.text,
-
-            "html.parser"
-
-        )
-
-        exams = []
-
-        assignments = []
-
-        meetings = []
-
-        lectures = []
-
+        # جلب التقويم
+        cal_resp = session.get("https://moodle.alaqsa.edu.ps/calendar/view.php?view=upcoming", timeout=15)
+        soup = BeautifulSoup(cal_resp.text, "html.parser")
+        
+        events = {"exams": [], "tasks": [], "meets": [], "others": []}
         skipped = 0
 
-        for ev_div in soup.find_all(
-
-            "div",
-
-            {"class": "event"}
-
-        ):
-
-            raw_txt = ev_div.get_text(
-
-                " ",
-
-                strip=True
-
-            )
-
-            if _quick_done(raw_txt):
-
+        for ev_div in soup.find_all("div", {"class": "event"}):
+            raw_txt = ev_div.get_text(" ", strip=True).lower()
+            
+            # تخطي المنجز
+            if any(k in raw_txt for k in ["تم التسليم", "submitted", "graded", "finished", "تم الحل"]):
                 skipped += 1
-
                 continue
 
-            ev = _extract_event(ev_div)
-
-            ll = ev["url_lower"]
-
-            tl = ev["raw"].lower()
-
-            is_quiz = (
-
-                "quiz" in ll
-
-                or any(w in tl for w in _EXAM_KW)
-
-            )
-
-            is_assign = (
-
-                "assign" in ll
-
-                or any(w in tl for w in _ASSIGN_KW)
-
-            )
-
-            is_meet = (
-
-                any(x in ll for x in _MEET_KW)
-
-                or "لقاء" in tl
-
-            )
-
-            if ev["url"]:
-
-                if is_assign and not is_quiz:
-
-                    if _assign_done(
-
-                        session,
-
-                        ev["url"]
-
-                    ):
-
-                        skipped += 1
-
-                        continue
-
-                elif is_quiz:
-
-                    if _quiz_done(
-
-                        session,
-
-                        ev["url"]
-
-                    ):
-
-                        skipped += 1
-
-                        continue
-
-            if is_quiz:
-
-                exams.append(
-
-                    _fmt_exam(ev)
-
-                )
-
-            elif is_assign:
-
-                assignments.append(
-
-                    _fmt_task(ev)
-
-                )
-
-            elif is_meet:
-
-                meetings.append(
-
-                    _fmt_task(ev)
-
-                )
-
-            else:
-
-                lectures.append(
-
-                    _fmt_task(ev)
-
-                )
-
-        msg = []
-
-        msg.append(
-
-            f"🕐 *{datetime.now().strftime('%Y-%m-%d %H:%M')}*"
-
-        )
-
-        msg.append(
-
-            f"\n📝 *الاختبارات غير المنجزة ({len(exams)}):*"
-
-        )
-
-        msg.append(
-
-            "لا يوجد"
-
-            if not exams
-
-            else "\n\n".join(exams)
-
-        )
-
-        msg.append(
-
-            f"\n⚠️ *التكاليف غير المنجزة ({len(assignments)}):*"
-
-        )
-
-        msg.append(
-
-            "لا يوجد"
-
-            if not assignments
-
-            else "\n\n".join(assignments)
-
-        )
-
-        msg.append(
-
-            f"\n🎥 *اللقاءات ({len(meetings)}):*"
-
-        )
-
-        msg.append(
-
-            "لا يوجد"
-
-            if not meetings
-
-            else "\n\n".join(meetings)
-
-        )
-
-        msg.append(
-
-            f"\n📚 *المحاضرات ({len(lectures)}):*"
-
-        )
-
-        msg.append(
-
-            "لا يوجد"
-
-            if not lectures
-
-            else "\n\n".join(lectures)
-
-        )
-
-        if skipped:
-
-            msg.append(
-
-                f"\n_✅ تم إخفاء {skipped} عنصر منجز_"
-
-            )
-
-        result = {
-
-            "status": "success",
-
-            "message": "\n".join(msg)
-
-        }
-
-        set_cached_report(
-
-            username,
-
-            result
-
-        )
-
-        return result
+            h3 = ev_div.find("h3")
+            name = h3.get_text(strip=True) if h3 else "نشاط"
+            atag = ev_div.find("a", href=True)
+            url = atag["href"] if atag else ""
+            
+            # استخراج الوقت وتعديل التوقيت
+            time_tag = ev_div.find("time")
+            time_str = "غير محدد"
+            if time_tag:
+                try:
+                    dt = datetime.fromisoformat((time_tag.get("datetime") or "").replace("Z", "+00:00"))
+                    dt += timedelta(hours=3) # توقيت فلسطين
+                    time_str = dt.strftime("%Y-%m-%d %I:%M %p")
+                except: pass
+
+            fmt_txt = f"▪️ *{esc(name)}*\n🕐 {esc(time_str)}"
+            
+            if "quiz" in url or "اختبار" in raw_txt: events["exams"].append(fmt_txt)
+            elif "assign" in url or "واجب" in raw_txt: events["tasks"].append(fmt_txt)
+            elif "zoom" in url or "meet" in url: events["meets"].append(fmt_txt)
+            else: events["others"].append(fmt_txt)
+
+        # بناء الرسالة
+        res_msg = [f"📅 *تحديث المودل:* `{datetime.now().strftime('%H:%M')}`\n"]
+        res_msg.append(f"📝 *الاختبارات:* {len(events['exams']) or 'لا يوجد'}")
+        if events['exams']: res_msg.append("\n".join(events['exams']))
+        
+        res_msg.append(f"\n⚠️ *التكاليف:* {len(events['tasks']) or 'لا يوجد'}")
+        if events['tasks']: res_msg.append("\n".join(events['tasks']))
+
+        if skipped: res_msg.append(f"\n_✅ تم إخفاء {skipped} مهام مكتملة_")
+
+        final_res = {"status": "success", "message": "\n".join(res_msg)}
+        CACHE[username] = (time.time(), final_res)
+        return final_res
 
     except Exception as e:
-
-        log.error(e)
-
-        return {
-
-            "status": "error",
-
-            "message": f"⚠️ خطأ: {str(e)[:100]}"
-
-        }
+        log.error(f"Moodle Error: {e}")
+        return {"status": "error", "message": "⚠️ حدث خطأ أثناء الاتصال بالمودل."}
 
 # =====================================================
-# الاشتراك
+# أوامر البوت
 # =====================================================
-
-
-def check_access(chat_id):
-
-    if datetime.now() < FREE_TRIAL_END:
-        return True
-
-    with get_db() as conn:
-
-        row = conn.execute(
-
-            "SELECT expiry_date,is_vip FROM users WHERE chat_id=?",
-
-            (chat_id,)
-
-        ).fetchone()
-
-    if not row:
-        return False
-
-    if row["is_vip"]:
-        return True
-
-    if row["expiry_date"]:
-
-        exp = datetime.strptime(
-
-            row["expiry_date"],
-
-            "%Y-%m-%d %H:%M:%S"
-
-        )
-
-        return exp > datetime.now()
-
-    return False
-
-# =====================================================
-# START
-# =====================================================
-
-
 @bot.message_handler(commands=["start"])
 def start(m):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("🔍 فحص سريع", "📊 حالتي")
+    bot.send_message(m.chat.id, "👋 أهلاً بك في بوت متابعة مودل الأقصى المطور.\n\nسيقوم البوت بتنبيهك تلقائياً عند وجود واجبات أو اختبارات جديدة.", reply_markup=kb)
 
-    kb = types.ReplyKeyboardMarkup(
+@bot.message_handler(func=lambda m: m.text in ["🔍 فحص سريع", "/check"])
+def handle_check(m):
+    with get_db() as conn:
+        user = conn.execute("SELECT username, password FROM users WHERE chat_id=?", (m.chat.id,)).fetchone()
 
-        resize_keyboard=True
-
-    )
-
-    kb.row(
-
-        "🔍 فحص الآن",
-
-        "📊 حالتي"
-
-    )
-
-    bot.send_message(
-
-        m.chat.id,
-
-        "🎓 أهلاً بك في بوت مودل الأقصى",
-
-        reply_markup=kb
-
-    )
-
-# =====================================================
-# CHECK
-# =====================================================
-
-
-@bot.message_handler(commands=["check"])
-def cmd_check(m):
-
-    do_check(m.chat.id)
-
-
-@bot.message_handler(func=lambda m: m.text == "🔍 فحص الآن")
-def btn_check(m):
-
-    do_check(m.chat.id)
-
-
-def do_check(chat_id):
-
-    ok = check_access(chat_id)
-
-    if not ok:
-
-        bot.send_message(
-
-            chat_id,
-
-            "🚫 الاشتراك منتهي"
-
-        )
-
+    if not user or not user["username"]:
+        msg = bot.send_message(m.chat.id, "📋 برجاء إرسال الرقم الجامعي:")
+        bot.register_next_step_handler(msg, process_user)
         return
 
-    with get_db() as conn:
+    wait_msg = bot.send_message(m.chat.id, "⏳ جاري جلب البيانات...")
+    
+    password = dec(user["password"])
+    if not password:
+        bot.edit_message_text("❌ خطأ في نظام التشفير، يرجى إعادة تسجيل الدخول.", m.chat.id, wait_msg.message_id)
+        return
 
-        row = conn.execute(
+    res = run_moodle(user["username"], password)
+    bot.edit_message_text(res["message"], m.chat.id, wait_msg.message_id)
 
-            "SELECT username,password FROM users WHERE chat_id=?",
+def process_user(m):
+    username = m.text.strip()
+    msg = bot.send_message(m.chat.id, "🔐 الآن أرسل كلمة المرور:")
+    bot.register_next_step_handler(msg, lambda ms: process_pass(ms, username))
 
-            (chat_id,)
-
-        ).fetchone()
-
-    if row and row["username"]:
-
-        wm = bot.send_message(
-
-            chat_id,
-
-            "🔍 جاري الفحص..."
-
-        )
-
-        res = run_moodle(
-
-            row["username"],
-
-            dec(row["password"])
-
-        )
-
-        try:
-
-            bot.edit_message_text(
-
-                res["message"],
-
-                chat_id,
-
-                wm.message_id,
-
-                parse_mode="Markdown"
-
-            )
-
-        except:
-
-            bot.send_message(
-
-                chat_id,
-
-                res["message"],
-
-                parse_mode="Markdown"
-
-            )
-
-    else:
-
-        wm = bot.send_message(
-
-            chat_id,
-
-            "📋 أرسل الرقم الجامعي"
-
-        )
-
-        bot.register_next_step_handler(
-
-            wm,
-
-            step_user
-
-        )
-
-# =====================================================
-# تسجيل الدخول
-# =====================================================
-
-
-def step_user(msg):
-
-    user = msg.text.strip()
-
-    wm = bot.send_message(
-
-        msg.chat.id,
-
-        "🔐 أرسل كلمة المرور"
-
-    )
-
-    bot.register_next_step_handler(
-
-        wm,
-
-        lambda m2: step_pwd(m2, user)
-
-    )
-
-
-def step_pwd(msg, user):
-
-    pwd = msg.text.strip()
-
-    wm = bot.send_message(
-
-        msg.chat.id,
-
-        "⏳ جاري التحقق"
-
-    )
-
-    res = run_moodle(user, pwd)
-
+def process_pass(m, username):
+    password = m.text.strip()
+    bot.send_message(m.chat.id, "⏳ يتم التحقق من بياناتك...")
+    
+    res = run_moodle(username, password)
     if res["status"] == "success":
-
         with get_db() as conn:
-
-            conn.execute(
-
-                "INSERT OR REPLACE INTO users(chat_id,username,password) VALUES(?,?,?)",
-
-                (
-
-                    msg.chat.id,
-
-                    user,
-
-                    enc(pwd)
-
-                )
-
-            )
-
-        bot.edit_message_text(
-
-            "✅ تم الربط بنجاح\n\n" + res["message"],
-
-            msg.chat.id,
-
-            wm.message_id,
-
-            parse_mode="Markdown"
-
-        )
-
+            conn.execute("INSERT OR REPLACE INTO users (chat_id, username, password, joined_at) VALUES (?,?,?,?)",
+                         (m.chat.id, username, enc(password), datetime.now().isoformat()))
+        bot.send_message(m.chat.id, "✅ تم تفعيل الاشتراك التلقائي بنجاح!")
+        bot.send_message(ADMIN_ID, f"🔔 مستخدم جديد: `{username}`")
     else:
-
-        bot.edit_message_text(
-
-            res["message"],
-
-            msg.chat.id,
-
-            wm.message_id
-
-        )
+        bot.send_message(m.chat.id, res["message"])
 
 # =====================================================
-# التقارير الدورية
+# نظام التنبيهات الدوري (محسن للأداء)
 # =====================================================
+def check_single_user(row):
+    try:
+        password = dec(row["password"])
+        if not password: return
 
+        res = run_moodle(row["username"], password)
+        if res["status"] != "success": return
+
+        new_hash = hashlib.md5(res["message"].encode()).hexdigest()
+        if row["last_hash"] != new_hash:
+            bot.send_message(row["chat_id"], "🔔 *تحديث جديد في المودل:*\n\n" + res["message"])
+            with get_db() as conn:
+                conn.execute("UPDATE users SET last_hash=?, last_report=? WHERE chat_id=?", 
+                             (new_hash, datetime.now().strftime("%Y-%m-%d %H:%M"), row["chat_id"]))
+    except Exception as e:
+        log.warning(f"Error checking {row['chat_id']}: {e}")
 
 def broadcast_reports():
-
-    if IS_HOLIDAY:
-        return
-
+    log.info("بدء جولة الفحص الدوري...")
     with get_db() as conn:
-
-        rows = conn.execute(
-
-            "SELECT chat_id,username,password,last_hash FROM users WHERE username IS NOT NULL"
-
-        ).fetchall()
-
-    for row in rows:
-
-        uid = row["chat_id"]
-
-        if not check_access(uid):
-            continue
-
-        try:
-
-            res = run_moodle(
-
-                row["username"],
-
-                dec(row["password"])
-
-            )
-
-            if res["status"] != "success":
-                continue
-
-            h = hashlib.md5(
-
-                res["message"].encode()
-
-            ).hexdigest()
-
-            if row["last_hash"] == h:
-                continue
-
-            bot.send_message(
-
-                uid,
-
-                "🔔 *تحديث جديد*\n\n" + res["message"],
-
-                parse_mode="Markdown"
-
-            )
-
-            with get_db() as conn:
-
-                conn.execute(
-
-                    "UPDATE users SET last_hash=?,last_report=? WHERE chat_id=?",
-
-                    (
-
-                        h,
-
-                        datetime.now().strftime("%Y-%m-%d %H:%M"),
-
-                        uid
-
-                    )
-
-                )
-
-        except Exception as e:
-
-            log.warning(e)
-
-# =====================================================
-# المجدول
-# =====================================================
-
+        users = conn.execute("SELECT * FROM users WHERE username IS NOT NULL").fetchall()
+    
+    # استخدام ThreadPoolExecutor لعمل فحص متوازي لـ 5 مستخدمين في نفس الوقت
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        executor.map(check_single_user, users)
 
 def scheduler_thread():
-
-    schedule.every(6).hours.do(
-
-        broadcast_reports
-
-    )
-
+    # الفحص الأول فور تشغيل البوت
+    time.sleep(10)
+    broadcast_reports()
+    
+    # ثم كل 4 ساعات
+    schedule.every(4).hours.do(broadcast_reports)
     while True:
-
         schedule.run_pending()
-
-        time.sleep(30)
+        time.sleep(60)
 
 # =====================================================
-# التشغيل
+# التشغيل النهائي
 # =====================================================
-
 if __name__ == "__main__":
-
     init_db()
-
-    threading.Thread(
-
-        target=scheduler_thread,
-
-        daemon=True
-
-    ).start()
-
-    log.info("✅ Bot Running")
-
-    bot.infinity_polling(
-
-        timeout=30,
-
-        long_polling_timeout=20
-
-    )
+    threading.Thread(target=scheduler_thread, daemon=True).start()
+    log.info("✅ Bot is online and scheduler started")
+    bot.infinity_polling()
