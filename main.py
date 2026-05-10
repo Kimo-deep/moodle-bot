@@ -18,7 +18,7 @@ from telebot import types
 # ══════════════════════════════════════════════════════════
 # 1. الإعدادات
 # ══════════════════════════════════════════════════════════
-DATA_DIR = "/app/data"
+DATA_DIR = "/app/data/"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 logging.basicConfig(
