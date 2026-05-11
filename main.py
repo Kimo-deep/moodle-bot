@@ -1018,9 +1018,7 @@ def cmd_broadcast(m):
         uids = [r[0] for r in conn.execute("SELECT chat_id FROM users").fetchall()]
     ok = 0
     for uid in uids:
-        try: bot.send_message(uid, f"📢 *إشعار:*
-
-{text}", parse_mode="Markdown"); ok += 1
+        try: bot.send_message(uid, f"📢 *إشعار:*\n\n{text}", parse_mode="Markdown"); ok += 1
         except: pass
     bot.send_message(m.chat.id, f"✅ أُرسلت لـ {ok}/{len(uids)} مستخدم.")
 
