@@ -753,22 +753,30 @@ def _step_pwd(msg, user):
 # ── استلام الإيصالات اليدوية ────────────────────────────
 @bot.message_handler(content_types=["photo"])
 def handle_photo(m):
-    kb = types.InlineKeyboardMarkup()
-    kb.add(
-        types.InlineKeyboardButton("✅ تفعيل شهر", callback_data=f"pay_{m.chat.id}"),
-        types.InlineKeyboardButton("❌ رفض",        callback_data=f"rej_{m.chat.id}")
-    )
     try:
-        uname = f"@{m.from_user.username}" if m.from_user.username else "بدون يوزرنيم"
-        bot.send_photo(ADMIN_ID, m.photo[-1].file_id,
-            caption=(f"📩 *طلب تفعيل يدوي*\n"
-                     f"👤 {uname} (`{m.chat.id}`)\n"
-                     f"📅 {datetime.now():%Y-%m-%d %H:%M}"),
-            reply_markup=kb, parse_mode="Markdown")
-        bot.reply_to(m, "⏳ تم إرسال الإيصال للأدمن.\nسيُشعرك فور المراجعة.")
+        # تأكد من أن الأدمن هو من سيستلم
+        file_id = m.photo[-1].file_id
+        uname = f"@{m.from_user.username}" if m.from_user.username else str(m.from_user.id)
+        
+        caption = (f"📩 *طلب تفعيل يدوي*\n"
+                   f"👤 {uname} (`{m.chat.id}`)\n"
+                   f"📅 {datetime.now():%Y-%m-%d %H:%M}")
+        
+        kb = types.InlineKeyboardMarkup()
+        kb.add(
+            types.InlineKeyboardButton("✅ تفعيل شهر", callback_data=f"pay_{m.chat.id}"),
+            types.InlineKeyboardButton("❌ رفض", callback_data=f"rej_{m.chat.id}")
+        )
+
+        bot.send_photo(ADMIN_ID, file_id, caption=caption, reply_markup=kb, parse_mode="Markdown")
+        bot.reply_to(m, "⏳ تم إرسال الإيصال للأدمن بنجاح.")
+        
+    except telebot.apihelper.ApiTelegramException as e:
+        log.error(f"Telegram Error: {e}")
+        bot.reply_to(m, "⚠️ فشل إرسال الصورة للأدمن. تأكد أن الأدمن بدأ البوت.")
     except Exception as e:
-        log.error(f"handle_photo: {e}")
-        bot.reply_to(m, "⚠️ حدث خطأ. حاول مجدداً.")
+        log.error(f"General Error: {e}")
+        bot.reply_to(m, "⚠️ حدث خطأ فني أثناء المعالجة.")
 
 # ══════════════════════════════════════════════════════════
 # 10. Callbacks
