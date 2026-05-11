@@ -751,7 +751,7 @@ def _step_pwd(msg, user):
         except: bot.send_message(msg.chat.id, res["message"])
 
 # ── استلام الإيصالات اليدوية ────────────────────────────
-@@bot.message_handler(content_types=["photo"])
+@bot.message_handler(content_types=["photo"])
 def handle_photo(m):
     try:
         # 1. الحصول على أعلى دقة للصورة
