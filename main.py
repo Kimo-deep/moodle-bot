@@ -228,80 +228,43 @@ def _extract_time_from_div(ev) -> str:
 
 def _extract_course_and_doctor(ev) -> tuple:
     """
-    يستخرج اسم المادة واسم الدكتور من HTML حدث مودل الأقصى.
-
-    البنية الفعلية في مودل الأقصى:
-      <div class="description">
-        اسم المادة أ.اسم الدكتور
-        <a href="...">إذهب إلى النشاط</a>
-        <span>إضافة تسليم</span>
-      </div>
-    المادة والدكتور يكونان كـ text node مباشر داخل div.description
+    يستخرج اسم المادة واسم الدكتور من HTML الحدث.
+    مودل الأقصى يضع المادة في رابط /course/ أو في div.description.
     """
     course = ""
     doctor = "غير محدد"
-    raw_course = ""
 
-    # 1. div.description — المصدر الأساسي في مودل الأقصى
-    desc = ev.select_one("div.description") or ev.select_one(".description")
-    if desc:
-        # اجمع فقط النصوص المباشرة (text nodes) متجاهلاً نصوص الروابط الداخلية
-        direct_texts = []
-        for node in desc.children:
-            if hasattr(node, 'name'):
-                # تجاهل <a> و<span> الذين يحتويون على ضجيج
-                tag_text = node.get_text(" ", strip=True)
-                # أخذ نص الرابط فقط إذا كان يبدو اسم مادة (لا يحتوي ضجيج)
-                is_noise = any(n in tag_text for n in _NOISE)
-                if not is_noise and node.name == "a" and len(tag_text) > 3:
-                    direct_texts.append(tag_text)
-            else:
-                # text node مباشر
-                t = str(node).strip()
-                if t and not _TIME_RE.search(t):
-                    direct_texts.append(t)
-        raw_course = " ".join(direct_texts).strip()
-
-    # 2. fallback: أي رابط ليس رابط النشاط
-    if not raw_course:
-        h3 = ev.find("h3")
-        activity_url = (h3.find("a")["href"] if h3 and h3.find("a") else "") if h3 else ""
-        for a in ev.find_all("a", href=True):
-            if a["href"] == activity_url:
-                continue
+    # 1. رابط يحتوي على /course/
+    for a in ev.find_all("a", href=True):
+        href = a.get("href", "")
+        if "/course/" in href or "course" in href:
             t = a.get_text(" ", strip=True)
-            if t and 3 < len(t) < 150 and not any(n in t for n in _NOISE):
-                raw_course = t
+            # تجاهل إذا كان نفس الاسم أو قصير جداً
+            if t and 3 < len(t) < 150:
+                course = t
                 break
 
-    # 3. fallback: small tag
-    if not raw_course:
-        sm = ev.select_one("small")
-        if sm:
-            t = sm.get_text(" ", strip=True)
-            if t and 3 < len(t) < 200 and not _TIME_RE.search(t):
-                raw_course = t
+    # 2. div.description أو small كـ fallback
+    if not course:
+        for sel in ["div.description", ".description", "small"]:
+            tag = ev.select_one(sel)
+            if tag:
+                t = tag.get_text(" ", strip=True)
+                # تجنب الوقت أو النصوص الطويلة جداً
+                if t and 3 < len(t) < 200 and not _TIME_RE.search(t):
+                    course = t
+                    break
 
-    if not raw_course:
+    if not course:
         return "غير محدد", "غير محدد"
 
-    # ── فصل الدكتور عن المادة ──
-    # "خوارزميات متقدمة أ.فراس فؤاد العجلة"
-    # "برمجة مرئية أ.محمود مسعود عاشور"
-    doc_m = re.search(
-        r"\s*[أا]\.\s*([\u0600-\u06FF][\u0600-\u06FF\s]{2,30}?)\s*$",
-        raw_course
-    )
+    # فصل الدكتور عن المادة: "خوارزميات متقدمة أ.فراس فؤاد العجلة"
+    doc_m = re.search(r"\s+[أا]\.\s*([\u0600-\u06FF][^\n\u0600-\u06FF]{0,2}[\u0600-\u06FF\s]{2,25})", course)
     if doc_m:
-        doctor = doc_m.group(1).strip()
-        course = raw_course[:doc_m.start()].strip()
-    else:
-        course = raw_course
+        doctor = _clean_noise(doc_m.group(1)).strip()
+        course = course[:doc_m.start()].strip()
 
-    # تنظيف الضجيج من المادة والدكتور
     course = _clean_noise(course).strip() or "غير محدد"
-    doctor = _clean_noise(doctor).strip() if doctor != "غير محدد" else "غير محدد"
-
     return course, doctor
 
 
@@ -891,82 +854,36 @@ def cb_admin_pay(call):
 # ══════════════════════════════════════════════════════════
 def _admin(m): return m.chat.id == ADMIN_ID
 
-def _parse_uid(m, usage: str):
-    """مساعدة: يستخرج uid من الأمر أو يرسل رسالة خطأ."""
-    parts = m.text.split()
-    if len(parts) < 2:
-        bot.send_message(m.chat.id, f"الاستخدام: {usage}"); return None
-    try: return int(parts[1])
-    except:
-        bot.send_message(m.chat.id, "❌ ID غير صحيح."); return None
-
 @bot.message_handler(commands=["vip"])
 def cmd_vip(m):
-    """/vip [chat_id] — تفعيل VIP مدى الحياة"""
+    """/vip [chat_id] — تفعيل VIP"""
     if not _admin(m): return
-    uid = _parse_uid(m, "/vip [chat_id]")
-    if uid is None: return
+    parts = m.text.split()
+    if len(parts) < 2:
+        bot.send_message(m.chat.id, "الاستخدام: /vip [chat\\_id]", parse_mode="Markdown")
+        return
+    try: uid = int(parts[1])
+    except:
+        bot.send_message(m.chat.id, "❌ ID غير صحيح."); return
     activate(uid, "VIP")
     try: bot.send_message(uid, "🌟 تم تفعيل اشتراك VIP من قِبل الإدارة!")
     except: pass
     bot.send_message(m.chat.id, f"✅ VIP فعّال للمستخدم `{uid}`.", parse_mode="Markdown")
 
-@bot.message_handler(commands=["addmonth"])
-def cmd_addmonth(m):
-    """/addmonth [chat_id] — إضافة شهر اشتراك"""
-    if not _admin(m): return
-    uid = _parse_uid(m, "/addmonth [chat_id]")
-    if uid is None: return
-    # نجمع على الوقت الحالي أو على تاريخ الانتهاء الحالي إذا لم ينتهِ
-    with get_db() as conn:
-        conn.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (uid,))
-        row = conn.execute("SELECT expiry_date, is_vip FROM users WHERE chat_id=?", (uid,)).fetchone()
-        if row and row["is_vip"]:
-            bot.send_message(m.chat.id, f"ℹ️ المستخدم `{uid}` لديه VIP مدى الحياة.", parse_mode="Markdown")
-            return
-        base = datetime.now()
-        if row and row["expiry_date"]:
-            try:
-                existing = datetime.strptime(row["expiry_date"], "%Y-%m-%d %H:%M:%S")
-                if existing > datetime.now(): base = existing
-            except: pass
-        new_exp = (base + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
-        conn.execute("UPDATE users SET expiry_date=?, is_vip=0 WHERE chat_id=?", (new_exp, uid))
-    try: bot.send_message(uid, "✅ تم تجديد اشتراكك لشهر إضافي!")
-    except: pass
-    bot.send_message(m.chat.id, f"✅ أُضيف شهر للمستخدم `{uid}`.\nينتهي: {new_exp}", parse_mode="Markdown")
-
 @bot.message_handler(commands=["revoke"])
 def cmd_revoke(m):
-    """/revoke [chat_id] — إلغاء اشتراك مستخدم"""
+    """/revoke [chat_id] — إلغاء اشتراك"""
     if not _admin(m): return
-    uid = _parse_uid(m, "/revoke [chat_id]")
-    if uid is None: return
+    parts = m.text.split()
+    if len(parts) < 2:
+        bot.send_message(m.chat.id, "الاستخدام: /revoke [chat\\_id]", parse_mode="Markdown")
+        return
+    try: uid = int(parts[1])
+    except:
+        bot.send_message(m.chat.id, "❌ ID غير صحيح."); return
     with get_db() as conn:
         conn.execute("UPDATE users SET is_vip=0, expiry_date=NULL WHERE chat_id=?", (uid,))
-    try: bot.send_message(uid, "⚠️ تم إلغاء اشتراكك. تواصل مع الدعم للاستفسار.")
-    except: pass
     bot.send_message(m.chat.id, f"✅ تم إلغاء اشتراك `{uid}`.", parse_mode="Markdown")
-
-@bot.message_handler(commands=["userinfo"])
-def cmd_userinfo(m):
-    """/userinfo [chat_id] — معلومات مستخدم"""
-    if not _admin(m): return
-    uid = _parse_uid(m, "/userinfo [chat_id]")
-    if uid is None: return
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT username, expiry_date, is_vip, last_report FROM users WHERE chat_id=?", (uid,)
-        ).fetchone()
-    if not row:
-        bot.send_message(m.chat.id, f"❌ المستخدم `{uid}` غير موجود.", parse_mode="Markdown"); return
-    sub = "🌟 VIP" if row["is_vip"] else (f"✅ حتى {row['expiry_date']}" if row["expiry_date"] else "❌ غير مشترك")
-    bot.send_message(m.chat.id,
-        f"👤 *معلومات المستخدم `{uid}`:*\n\n"
-        f"🔗 الرقم الجامعي: `{row['username'] or 'غير مرتبط'}`\n"
-        f"🎫 الاشتراك: {sub}\n"
-        f"📅 آخر تقرير: {row['last_report'] or 'لم يُرسل'}",
-        parse_mode="Markdown")
 
 @bot.message_handler(commands=["holiday"])
 def cmd_holiday(m):
@@ -974,7 +891,7 @@ def cmd_holiday(m):
     if not _admin(m): return
     IS_HOLIDAY = not IS_HOLIDAY
     bot.send_message(m.chat.id,
-        "🏖️ وضع العطلة *مفعّل* — التقارير متوقفة." if IS_HOLIDAY
+        "🏖️ وضع العطلة *مفعّل* — لن تُرسل تقارير." if IS_HOLIDAY
         else "✅ وضع العطلة *ملغى* — التقارير ستُستأنف.",
         parse_mode="Markdown")
 
@@ -985,28 +902,22 @@ def cmd_stats(m):
         total   = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         linked  = conn.execute("SELECT COUNT(*) FROM users WHERE username IS NOT NULL").fetchone()[0]
         vip     = conn.execute("SELECT COUNT(*) FROM users WHERE is_vip=1").fetchone()[0]
-        active  = conn.execute("SELECT COUNT(*) FROM users WHERE expiry_date > datetime('now')").fetchone()[0]
-        pending = conn.execute("SELECT COUNT(*) FROM payments WHERE status='pending'").fetchone()[0]
-        trial_active = 1 if datetime.now() < FREE_TRIAL_END else 0
-    stats_msg = (
+        active  = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE expiry_date > datetime('now')"
+        ).fetchone()[0]
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM payments WHERE status='pending'"
+        ).fetchone()[0]
+    bot.send_message(m.chat.id,
         f"📊 *إحصائيات البوت:*\n\n"
-        f"👥 إجمالي المستخدمين: {total}\n"
-        f"🔗 مرتبطون بالمودل: {linked}\n"
+        f"👥 المستخدمون: {total}\n"
+        f"🔗 مرتبطون: {linked}\n"
         f"🌟 VIP: {vip}\n"
         f"✅ اشتراك نشط: {active}\n"
-        f"⏳ طلبات دفع معلقة: {pending}\n"
-        f"💵 السعر الحالي: {price_str()}\n"
-        f"🆓 الفترة التجريبية: {'نشطة' if trial_active else 'انتهت'}\n"
-        f"🏖️ وضع العطلة: {'مفعّل' if IS_HOLIDAY else 'ملغى'}\n\n"
-        "📋 *أوامر الأدمن:*\n"
-        "/vip [id] — تفعيل VIP\n"
-        "/addmonth [id] — إضافة شهر\n"
-        "/revoke [id] — إلغاء اشتراك\n"
-        "/userinfo [id] — معلومات مستخدم\n"
-        "/broadcast [نص] — إشعار للجميع\n"
-        "/holiday — تفعيل/إلغاء العطلة"
-    )
-    bot.send_message(m.chat.id, stats_msg, parse_mode="Markdown")
+        f"⏳ طلبات معلقة: {pending}\n"
+        f"💵 السعر: {price_str()}\n"
+        f"🏖️ العطلة: {'مفعّل' if IS_HOLIDAY else 'ملغى'}",
+        parse_mode="Markdown")
 
 @bot.message_handler(commands=["broadcast"])
 def cmd_broadcast(m):
@@ -1025,22 +936,6 @@ def cmd_broadcast(m):
 # ══════════════════════════════════════════════════════════
 # 12. التقارير الدورية
 # ══════════════════════════════════════════════════════════
-def _report_has_content(msg: str) -> bool:
-    """
-    يتحقق إذا التقرير يحتوي على أي شيء غير منجز.
-    إذا كل الأقسام "لا يوجد" → لا يرسل.
-    """
-    sections = ["المحاضرات", "اللقاءات", "الاختبارات", "التكاليف"]
-    for sec in sections:
-        # ابحث عن القسم: إذا لم يكن "لا يوجد" بعده مباشرة → يوجد محتوى
-        pattern = re.search(rf"\*.*{re.escape(sec)}.*\*\s*(?!لا يوجد)", msg)
-        if pattern:
-            # تأكد أن بعد العنوان يوجد فعلاً محتوى (▪️)
-            rest = msg[pattern.end():]
-            if "▪️" in rest.split("\n\n📚")[0].split("\n\n🎥")[0].split("\n\n📝")[0].split("\n\n⚠️")[0]:
-                return True
-    return False
-
 def broadcast_reports():
     if IS_HOLIDAY: return
     with get_db() as conn:
@@ -1056,18 +951,15 @@ def broadcast_reports():
         if res["status"] != "success": continue
 
         msg = res["message"]
-
-        # لا ترسل إذا لا يوجد أي شيء في التقرير
-        if not _report_has_content(msg): continue
-
-        h = hashlib.md5(msg.encode()).hexdigest()
+        h   = hashlib.md5(msg.encode()).hexdigest()
 
         with get_db() as conn:
             old = conn.execute(
                 "SELECT last_hash FROM users WHERE chat_id=?", (uid,)
             ).fetchone()
-            # نفس المحتوى تماماً → لا ترسل (منع الإزعاج)
-            if old and old["last_hash"] == h: continue
+            # لا ترسل إذا نفس المحتوى تماماً (تجنب الإزعاج بدون سبب)
+            if old and old["last_hash"] == h:
+                continue
             try:
                 bot.send_message(uid, f"🔔 *تقرير المودل:*\n\n{msg}",
                                  parse_mode="Markdown")
