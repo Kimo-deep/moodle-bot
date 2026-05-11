@@ -751,32 +751,50 @@ def _step_pwd(msg, user):
         except: bot.send_message(msg.chat.id, res["message"])
 
 # ── استلام الإيصالات اليدوية ────────────────────────────
-@bot.message_handler(content_types=["photo"])
+@@bot.message_handler(content_types=["photo"])
 def handle_photo(m):
     try:
-        # تأكد من أن الأدمن هو من سيستلم
+        # 1. الحصول على أعلى دقة للصورة
         file_id = m.photo[-1].file_id
-        uname = f"@{m.from_user.username}" if m.from_user.username else str(m.from_user.id)
         
-        caption = (f"📩 *طلب تفعيل يدوي*\n"
-                   f"👤 {uname} (`{m.chat.id}`)\n"
-                   f"📅 {datetime.now():%Y-%m-%d %H:%M}")
+        # 2. تنظيف البيانات لتجنب أخطاء الـ Markdown
+        user_id = m.chat.id
+        first_name = m.from_user.first_name.replace('_', '\\_').replace('*', '\\*')
+        username = f"@{m.from_user.username}".replace('_', '\\_') if m.from_user.username else "بدون يوزرنيم"
         
+        # 3. تجهيز نص الرسالة
+        caption = (
+            f"📩 *طلب تفعيل يدوي*\n\n"
+            f"👤 الاسم: {first_name}\n"
+            f"🆔 الآيدي: `{user_id}`\n"
+            f"🔗 اليوزر: {username}\n"
+            f"📅 التاريخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
+        
+        # 4. أزرار التحكم
         kb = types.InlineKeyboardMarkup()
         kb.add(
-            types.InlineKeyboardButton("✅ تفعيل شهر", callback_data=f"pay_{m.chat.id}"),
-            types.InlineKeyboardButton("❌ رفض", callback_data=f"rej_{m.chat.id}")
+            types.InlineKeyboardButton("✅ تفعيل شهر", callback_data=f"pay_{user_id}"),
+            types.InlineKeyboardButton("❌ رفض", callback_data=f"rej_{user_id}")
         )
-
-        bot.send_photo(ADMIN_ID, file_id, caption=caption, reply_markup=kb, parse_mode="Markdown")
-        bot.reply_to(m, "⏳ تم إرسال الإيصال للأدمن بنجاح.")
         
+        # 5. محاولة الإرسال للأدمن
+        bot.send_photo(ADMIN_ID, file_id, caption=caption, reply_markup=kb, parse_mode="Markdown")
+        
+        # 6. تأكيد للمستخدم
+        bot.reply_to(m, "⏳ تم إرسال الإيصال للإدارة بنجاح، سيتم الرد عليك قريباً.")
+
     except telebot.apihelper.ApiTelegramException as e:
-        log.error(f"Telegram Error: {e}")
-        bot.reply_to(m, "⚠️ فشل إرسال الصورة للأدمن. تأكد أن الأدمن بدأ البوت.")
+        log.error(f"Telegram API Error: {e}")
+        # إذا فشل الماركدوان، نحاول الإرسال بدون تنسيق كخطة بديلة
+        try:
+            bot.send_photo(ADMIN_ID, file_id, caption=f"طلب يدوي من: {user_id}")
+            bot.reply_to(m, "✅ تم الإرسال (بدون تنسيق).")
+        except:
+            bot.reply_to(m, f"❌ فشل الإرسال للأدمن. السبب: {e.description}")
     except Exception as e:
-        log.error(f"General Error: {e}")
-        bot.reply_to(m, "⚠️ حدث خطأ فني أثناء المعالجة.")
+        log.error(f"Error: {e}")
+        bot.reply_to(m, "⚠️ حدث خطأ تقني داخلي.")
 
 # ══════════════════════════════════════════════════════════
 # 10. Callbacks
