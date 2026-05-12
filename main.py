@@ -959,6 +959,49 @@ def cmd_broadcast(m):
         except: pass
     bot.send_message(m.chat.id, f"✅ أُرسلت لـ {ok}/{len(uids)} مستخدم.")
 
+@bot.message_handler(commands=["report_all"])
+def cmd_report_all(m):
+    if not _admin(m): return
+    
+    bot.send_message(m.chat.id, "🚀 جاري فحص وإرسال التقارير للجميع، قد يستغرق الأمر وقتاً...")
+    
+    with get_db() as conn:
+        users = conn.execute(
+            "SELECT chat_id, username, password FROM users WHERE username IS NOT NULL"
+        ).fetchall()
+
+    success_count = 0
+    fail_count = 0
+
+    for row in users:
+        uid, user, pwd = row["chat_id"], row["username"], row["password"]
+        
+        # التأكد من صلاحية الاشتراك
+        if not check_access(uid)[0]: continue
+
+        res = run_moodle(user, pwd)
+        if res["status"] == "success":
+            try:
+                bot.send_message(uid, f"🔔 *تحديث فوري من الإدارة:*\n\n{res['message']}", 
+                                 parse_mode="Markdown")
+                success_count += 1
+                
+                # تحديث قاعدة البيانات
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE users SET last_report=? WHERE chat_id=?",
+                        (datetime.now().strftime("%Y-%m-%d %H:%M"), uid)
+                    )
+            except Exception:
+                fail_count += 1
+        else:
+            fail_count += 1
+
+    bot.send_message(m.chat.id, 
+                     f"✅ اكتمل الإرسال الجماعي:\n"
+                     f"🟢 تم بنجاح: {success_count}\n"
+                     f"🔴 فشل/حظر: {fail_count}")
+
 # ══════════════════════════════════════════════════════════
 # 12. التقارير الدورية
 # ══════════════════════════════════════════════════════════
