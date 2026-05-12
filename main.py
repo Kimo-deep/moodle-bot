@@ -133,38 +133,55 @@ _OPEN_KW, _CLOSE_KW = ["يُفتح", "يفتح", "open"], ["يُغلق", "يغل
 _TIME_RE = re.compile(r"(?:الأحد|الاثنين|الثلاثاء|الأربعاء|الخميس|الجمعة|السبت|غدًا|اليوم).*\d{1,2}:\d{2}\s*(?:AM|PM|ص|م)", re.U)
 
 def _extract_event(ev) -> dict:
-    h3 = ev.find("h3") or ev.find(class_="name")
-    atag = (h3.find("a", href=True) if h3 else None) or ev.find("a", href=True)
-    url = atag["href"] if atag else ""
-    raw_name = h3.get_text(strip=True) if h3 else "بدون اسم"
-    
-    # استخراج الوقت
+    """نسخة محسنة جداً لاستخراج المادة والوقت من عرض الشهر"""
+    # 1. استخراج الاسم (من التايتل أو النص)
+    atag = ev.find("a", {"data-action": "view-event"})
+    raw_name = ""
+    if atag:
+        raw_name = atag.get("title") or atag.get_text(strip=True)
+    if not raw_name:
+        raw_name = ev.get_text(strip=True)
+
+    # 2. استخراج المادة (في عرض الشهر المادة غالباً تكون في الـ Title الخاص بالرابط)
+    course = "غير محدد"
+    # نحاول البحث عن اسم المادة في التايتل (غالباً المودل يكتب: اسم الحدث هو جزء من مساق كذا)
+    title_text = atag.get("title", "") if atag else ""
+    if "من مساق" in title_text:
+        course = title_text.split("من مساق")[-1].strip()
+    elif "is due for the course" in title_text:
+        course = title_text.split("is due for the course")[-1].strip()
+
+    # 3. استخراج الوقت (نبحث عن أي نص يشبه التوقيت)
     time_val = ""
-    date_tag = ev.select_one(".date, .event-date")
-    if date_tag: time_val = date_tag.get_text(strip=True)
+    # نبحث عن كلاسات الوقت المشهورة في عرض الشهر
+    time_tag = ev.find(class_=re.compile(r"time|date"))
+    if time_tag:
+        time_val = time_tag.get_text(strip=True)
+    
+    # إذا لم يجد، نبحث بالـ Regex في النص المحيط
     if not time_val:
-        m = _TIME_RE.search(ev.get_text(" "))
-        if m: time_val = m.group()
+        match = _TIME_RE.search(ev.get_parent().get_text(" ")) if ev.get_parent() else None
+        if match:
+            time_val = match.group()
 
-    # استخراج المادة
-    course, doctor = "غير محدد", "غير محدد"
-    for a in ev.find_all("a", href=True):
-        if "/course/" in a["href"]:
-            course = a.get_text(strip=True)
-            break
-            
-    role = "open" if any(k in raw_name for k in _OPEN_KW) else "close" if any(k in raw_name for k in _CLOSE_KW) else "single"
-    return {"name": raw_name, "course": course, "doctor": doctor, "url": url, "time": time_val, "role": role, "raw": ev.get_text(" ")}
+    # 4. تحديد الدور (فتح/إغلاق) لتسهيل الدمج
+    role = "single"
+    if any(k in raw_name for k in ["يُفتح", "فتح", "opens"]): role = "open"
+    elif any(k in raw_name for k in ["يُغلق", "إغلاق", "closes", "مستحق", "due"]): role = "close"
 
-def _merge_exams(events: list) -> list:
-    merged, singles = {}, []
-    for ev in events:
-        key = (ev["name"].lower(), ev["course"].lower())
-        if ev["role"] == "single": singles.append(ev); continue
-        if key not in merged: merged[key] = ev.copy()
-        if ev["role"] == "open": merged[key]["date_open"] = ev["time"]
-        else: merged[key]["date_close"] = ev["time"]
-    return list(merged.values()) + singles
+    # تنظيف اسم الحدث من الزوائد
+    clean_name = re.sub(r"(يُفتح|يفتح|يُغلق|يغلق|مستحق|opens|closes|is due).*", "", raw_name).strip()
+
+    return {
+        "name": clean_name or raw_name,
+        "course": course,
+        "doctor": "يُرجى مراجعة المساق", # الدكتور يصعب جلبه من عرض الشهر مباشرة
+        "url": atag["href"] if atag else "",
+        "time": time_val,
+        "role": role,
+        "raw": raw_name
+    }
+
 
 # ══════════════════════════════════════════════════════════
 # 6. محرك المودل (الرئيسي)
