@@ -382,7 +382,8 @@ def _fmt_other(ev: dict) -> str:
 # ══════════════════════════════════════════════════════════
 _DONE_KW = [
     "تم التسليم", "submitted", "تخطى", "سلمت", "تم الإرسال",
-    "attempt already", "تم المحاولة", "no attempts allowed", "past due", "overdue",
+    "attempt already", "تم المحاولة", "no attempts allowed", 
+    "past due", "overdue", "انتهى", "closed", "finished"
 ]
 
 def _quick_done(text: str) -> bool:
@@ -391,23 +392,33 @@ def _quick_done(text: str) -> bool:
 
 def _assign_done(session, url: str) -> bool:
     try:
-        soup = BeautifulSoup(session.get(url, timeout=12).text, "html.parser")
+        response = session.get(url, timeout=12)
+        soup = BeautifulSoup(response.text, "html.parser")
+        page_content = soup.get_text(" ", strip=True).lower()
+
+        # 1. فحص الكلمات القاطعة في نص الصفحة
+        done_indicators = [
+            "تعديل التسليم", "edit submission", "إزالة التسليم", 
+            "remove submission", "لقد قمت بتسليم", "you have submitted"
+        ]
+        if any(k in page_content for k in done_indicators):
+            return True
+
+        # 2. فحص جدول الحالة (الطريقة التقليدية)
         for tr in soup.find_all("tr"):
             th = tr.find("th"); td = tr.find("td")
             if not (th and td): continue
             label = th.get_text(strip=True).lower()
             value = td.get_text(strip=True).lower()
-            if not any(k in label for k in ["حالة التسليم", "submission status", "status"]):
-                continue
-            if any(k in value for k in ["لم يُسلَّم", "no submission", "not submitted", "لم يتم"]):
-                return False
-            return True
-        page = soup.get_text(" ", strip=True).lower()
-        return any(k in page for k in [
-            "تعديل التسليم", "edit submission", "you have submitted", "already submitted",
-        ])
+            
+            if any(k in label for k in ["حالة التسليم", "submission status", "status"]):
+                # إذا وجدت الحالة "مسلمة" أو "تم رصد الدرجة"
+                if any(k in value for k in ["محملة للتصحيح", "submitted", "تم التسليم", "graded"]):
+                    return True
+        return False
     except Exception:
         return False
+
 
 def _quiz_done(session, url: str) -> bool:
     try:
@@ -448,10 +459,8 @@ def run_moodle(username: str, password: str) -> dict:
             return {"status": "fail", "message": "❌ بيانات المودل غير صحيحة."}
 
         # ── صفحة التقويم ──
-        soup = BeautifulSoup(
-            session.get("https://moodle.alaqsa.edu.ps/calendar/view.php?view=upcoming",
-                        timeout=20).text, "html.parser"
-        )
+        calendar_url = "https://moodle.alaqsa.edu.ps/calendar/view.php?view=month"
+soup = BeautifulSoup(session.get(calendar_url, timeout=20).text, "html.parser")
 
         lectures, meetings, exams_raw, assignments = [], [], [], []
         skipped = 0
