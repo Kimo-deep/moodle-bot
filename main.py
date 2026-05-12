@@ -267,8 +267,16 @@ def run_moodle(username, password) -> dict:
         report = [f"🕐 *تقرير: {now}*\n"]
         
         def fmt(e):
-            time_str = f"📅 {e['time']}" if e['time'] else "📅 موعد غير محدد"
-            return f"▪️ *{e['name']}*\n   📌 {e['course']}\n   {time_str}"
+    # محاولة أخيرة لاستنتاج المادة من الرابط إذا بقيت "غير محدد"
+    course_display = e['course']
+    if course_display == "غير محدد" and "course=" in e['url']:
+        # استخراج آيدي المساق كحل بديل
+        c_id = re.search(r"course=(\d+)", e['url'])
+        if c_id: course_display = f"مساق رقم ({c_id.group(1)})"
+    
+    time_str = f"📅 {e['time']}" if e['time'] else "📅 (تفقد الساعة بالداخل)"
+    return f"▪️ *{e['name']}*\n   📌 {course_display}\n   {time_str}"
+
 
         if meetings:
             report.append("🎥 *اللقاءات والمحاضرات:*\n" + "\n\n".join(fmt(e) for e in meetings))
