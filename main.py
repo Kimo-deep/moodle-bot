@@ -188,22 +188,30 @@ def _dt_to_arabic(dt: datetime) -> str:
     return f"{d}, {dt.day} {mo}, {hr} {ampm}"
 
 def _extract_time(ev) -> str:
-    """يستخرج الوقت من عنصر الحدث، متجاهلاً div.description."""
-    # نسخة مؤقتة بدون description لمنع الخلط مع المادة
+    """
+    يستخرج الوقت من الحدث.
+    الوقت في مودل الأقصى يكون في div.date داخل col-1 أو <time>.
+    نستبعد h3 فقط (الاسم) لا description كلها.
+    """
     ev_clone = BeautifulSoup(str(ev), "html.parser")
-    for tag in ev_clone.select("div.description, .description, small"):
+    # استبعد الاسم فقط لا كل description
+    for tag in ev_clone.find_all("h3"):
         tag.decompose()
+    # استبعد نصوص الضجيج
+    for a in ev_clone.find_all("a", href=True):
+        if any(n in a.get_text(" ", strip=True) for n in _NOISE):
+            a.decompose()
 
-    # 1. عنصر .date المخصص
-    for sel in [".date", ".event-date", ".col-1", "[class*='date']"]:
+    # 1. عنصر .date (الأعلى موثوقية)
+    for sel in [".col-1 .date", ".date", ".event-date", "[class*='date']"]:
         tag = ev_clone.select_one(sel)
         if tag:
             t = tag.get_text(" ", strip=True)
-            if _TIME_RE.search(t):
-                m = _TIME_RE.search(t)
+            m = _TIME_RE.search(t)
+            if m:
                 return m.group(0).strip()
 
-    # 2. عنصر <time datetime="...">
+    # 2. <time datetime="...">
     for tag in ev_clone.find_all("time"):
         dt_str = tag.get("datetime", "")
         if dt_str:
@@ -214,14 +222,15 @@ def _extract_time(ev) -> str:
                 return _dt_to_arabic(dt)
             except Exception:
                 pass
-        label = tag.get_text(" ", strip=True)
-        if _TIME_RE.search(label):
-            return _TIME_RE.search(label).group(0).strip()
+        m = _TIME_RE.search(tag.get_text(" ", strip=True))
+        if m:
+            return m.group(0).strip()
 
-    # 3. آخر تطابق في باقي النص (بعد حذف description)
-    raw = ev_clone.get_text(" ", strip=True)
+    # 3. آخر تطابق في بقية النص
+    raw     = ev_clone.get_text(" ", strip=True)
     matches = _TIME_RE.findall(raw)
     return matches[-1].strip() if matches else ""
+
 
 # ══════════════════════════════════════════════════════════
 # 7. استخراج المادة والدكتور
@@ -229,33 +238,53 @@ def _extract_time(ev) -> str:
 def _extract_course_doctor(ev) -> tuple:
     """
     يستخرج المادة والدكتور.
-    مودل الأقصى يضع المادة في:
-      <a href="...course/view.php?id=...">اسم المادة أ.اسم الدكتور</a>
+    رابط المادة: href يحتوي /course/view.php
+    اسم النشاط: href يحتوي /mod/ أو /quiz/ أو assign
     """
     raw_course = ""
 
-    # 1. رابط href يحتوي "course" و"view" = رابط المادة الرسمي
+    # رابط h3 = رابط النشاط، نستبعده من البحث
+    h3   = ev.find("h3") or ev.find(class_="name")
+    act_link = (h3.find("a", href=True)["href"]
+                if h3 and h3.find("a", href=True) else "")
+
+    # 1. رابط /course/view.php (رابط المادة الرسمي في مودل)
     for a in ev.find_all("a", href=True):
         href = a.get("href", "")
-        if "course" in href and ("view" in href or "id=" in href):
+        # تجاهل رابط النشاط نفسه
+        if href == act_link:
+            continue
+        if "/course/view.php" in href or ("/course/" in href and "id=" in href):
             t = a.get_text(" ", strip=True)
             if t and len(t) > 4 and not _TIME_RE.search(t):
                 raw_course = t
                 break
 
-    # 2. text nodes مباشرة في description (بدون روابط الضجيج)
+    # 2. div.description — text nodes فقط (بدون أي روابط أو وقت)
     if not raw_course:
-        desc = (ev.select_one("div.description")
-                or ev.select_one(".description"))
+        desc = ev.select_one("div.description") or ev.select_one(".description")
         if desc:
-            for node in desc.children:
-                if not hasattr(node, "name"):  # text node
-                    t = str(node).strip()
-                    if (t and len(t) > 4
-                            and not _TIME_RE.search(t)
-                            and not any(n in t for n in _NOISE)):
-                        raw_course = t
-                        break
+            # أولاً جرب الرابط داخل description إذا لم يكن رابط نشاط
+            for a in desc.find_all("a", href=True):
+                href = a.get("href", "")
+                if href == act_link:
+                    continue
+                t = a.get_text(" ", strip=True)
+                if (t and len(t) > 4
+                        and not _TIME_RE.search(t)
+                        and not any(n in t for n in _NOISE)):
+                    raw_course = t
+                    break
+            # إذا ما وُجد، جرب text nodes
+            if not raw_course:
+                for node in desc.children:
+                    if not hasattr(node, "name"):
+                        t = str(node).strip()
+                        if (t and len(t) > 4
+                                and not _TIME_RE.search(t)
+                                and not any(n in t for n in _NOISE)):
+                            raw_course = t
+                            break
 
     if not raw_course:
         return "غير محدد", "غير محدد"
@@ -278,13 +307,48 @@ def _extract_course_doctor(ev) -> tuple:
 # 8. استخراج الحدث الكامل
 # ══════════════════════════════════════════════════════════
 def _extract_event(ev) -> dict:
+    """
+    بنية مودل الأقصى الفعلية:
+      <div class="event">
+        <div class="card-body">
+          <h3 class="name">
+            <a href="/mod/quiz/view.php?id=...">MIDTERM EXAM يُفتح</a>
+          </h3>
+          <div class="description">
+            <a href="/course/view.php?id=...">خوارزميات متقدمة أ.ريهام زياد مقاط</a>
+            <span>إضافة تسليم</span>
+          </div>
+        </div>
+        <div class="col-1">
+          <div class="date">السبت, 16 مايو, 11:00 AM</div>
+        </div>
+      </div>
+    """
+    # ── الاسم: من رابط h3 فقط (ليس كل نص h3) ──
     h3   = ev.find("h3") or ev.find(class_="name")
     atag = (h3.find("a", href=True) if h3 else None) or ev.find("a", href=True)
     url  = atag["href"] if atag else ""
 
-    raw_name  = _clean_noise(h3.get_text(" ", strip=True) if h3 else "")
+    # أهم تعديل: نأخذ نص الرابط فقط وليس كل h3
+    # لأن h3 قد يحتوي على عناصر أخرى nested
+    if atag:
+        raw_name = atag.get_text(" ", strip=True)
+    elif h3:
+        # إذا لم يوجد رابط، خذ أول text node مباشر في h3
+        raw_name = ""
+        for node in h3.children:
+            if not hasattr(node, "name"):
+                raw_name = str(node).strip()
+                if raw_name:
+                    break
+        if not raw_name:
+            raw_name = h3.get_text(" ", strip=True)
+    else:
+        raw_name = ""
+
+    raw_name  = _clean_noise(raw_name).strip()
     role      = _event_role(raw_name)
-    base_name = _strip_role_suffix(raw_name) or raw_name[:70]
+    base_name = _strip_role_suffix(raw_name).strip() or raw_name[:70]
 
     course, doctor = _extract_course_doctor(ev)
     time_val       = _extract_time(ev)
