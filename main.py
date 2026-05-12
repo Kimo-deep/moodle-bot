@@ -175,56 +175,105 @@ def run_moodle(username, password) -> dict:
     login_url = "https://moodle.alaqsa.edu.ps/login/index.php"
     
     try:
-        # تسجيل الدخول
+        # 1. تسجيل الدخول
         res_login = session.get(login_url, timeout=20).text
         soup_login = BeautifulSoup(res_login, "html.parser")
         token = soup_login.find("input", {"name": "logintoken"})
-        if not token: return {"status": "error", "message": "⚠️ المودل لا يستجيب حالياً."}
+        if not token: 
+            return {"status": "error", "message": "⚠️ المودل لا يستجيب حالياً."}
         
-        resp = session.post(login_url, data={"username": username, "password": password, "logintoken": token["value"]}, timeout=20)
-        if "login" in resp.url: return {"status": "fail", "message": "❌ البيانات غير صحيحة."}
+        resp = session.post(login_url, data={
+            "username": username, 
+            "password": password, 
+            "logintoken": token["value"]
+        }, timeout=20)
+        
+        if "login" in resp.url: 
+            return {"status": "fail", "message": "❌ بيانات المودل غير صحيحة."}
 
-        # جلب التقويم الشهري
+        # 2. جلب التقويم الشهري
         calendar_url = "https://moodle.alaqsa.edu.ps/calendar/view.php?view=month"
-        soup = BeautifulSoup(session.get(calendar_url, timeout=20).text, "html.parser")
+        calendar_html = session.get(calendar_url, timeout=20).text
+        soup = BeautifulSoup(calendar_html, "html.parser")
 
+        # 3. استخراج الأحداث (البحث في كل الروابط التي تمثل أحداثاً)
+        # في عرض الشهر، الأحداث غالباً ما تكون داخل data-event-id
+        event_links = soup.find_all("a", {"data-action": "view-event"})
+        
         exams_raw, assignments, meetings, others = [], [], [], []
         skipped = 0
+        processed_ids = set() # لتجنب التكرار
 
-        for ev_div in soup.find_all("div", {"class": "event"}):
-            raw_text = ev_div.get_text(" ", strip=True)
-            if _quick_done(raw_text): skipped += 1; continue
+        for link in event_links:
+            ev_id = link.get("data-event-id")
+            if ev_id in processed_ids: continue
+            processed_ids.add(ev_id)
+
+            # الحصول على الحاوية الأكبر للحدث (المربع الصغير)
+            container = link.find_parent("div", class_="calendar-event-container") or link
+            raw_text = container.get_text(" ", strip=True)
             
-            ev = _extract_event(ev_div)
+            # فحص إذا كان منجزاً (كويك دون)
+            if _quick_done(raw_text):
+                skipped += 1
+                continue
+
+            ev = _extract_event(container)
+            # تعزيز استخراج الاسم إذا فشل المستخرج العادي
+            if not ev["name"] or ev["name"] == "بدون اسم":
+                ev["name"] = link.get_text(strip=True)
+            
             url_l = ev["url"].lower()
-            
-            # فحص العمق
-            if "assign" in url_l and _assign_done(session, ev["url"]): skipped += 1; continue
-            if "quiz" in url_l and _quiz_done(session, ev["url"]): skipped += 1; continue
+            tl = raw_text.lower()
 
-            if "quiz" in url_l or any(x in raw_text for x in ["اختبار", "كويز"]): exams_raw.append(ev)
-            elif any(x in url_l or x in raw_text.lower() for x in ["zoom", "meet", "لقاء", "محاضرة"]): meetings.append(ev)
-            elif "assign" in url_l: assignments.append(ev)
-            else: others.append(ev)
+            # تصنيف الأحداث
+            is_quiz = "quiz" in url_l or any(x in tl for x in ["اختبار", "كويز", "امتحان"])
+            is_meet = any(x in url_l or x in tl for x in ["zoom", "meet", "لقاء", "محاضرة", "بث"])
+            is_assign = "assign" in url_l or any(x in tl for x in ["تكليف", "واجب", "مهمة"])
 
-        # دمج وبناء التقرير
+            # فحص العمق (هل تم التسليم فعلياً؟)
+            if ev["url"]:
+                if is_assign and not is_quiz:
+                    if _assign_done(session, ev["url"]):
+                        skipped += 1; continue
+                elif is_quiz:
+                    if _quiz_done(session, ev["url"]):
+                        skipped += 1; continue
+
+            if is_quiz:     exams_raw.append(ev)
+            elif is_meet:   meetings.append(ev)
+            elif is_assign: assignments.append(ev)
+            else:           others.append(ev)
+
+        # 4. بناء التقرير
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         report = [f"🕐 *تقرير: {now}*\n"]
         
-        def fmt(e): return f"▪️ *{e['name']}*\n   📌 {e['course']}\n   📅 {e.get('time', '')}"
+        def fmt(e):
+            time_str = f"📅 {e['time']}" if e['time'] else "📅 موعد غير محدد"
+            return f"▪️ *{e['name']}*\n   📌 {e['course']}\n   {time_str}"
 
-        if meetings: report.append("🎥 *اللقاءات والمحاضرات:*\n" + "\n".join(fmt(e) for e in meetings))
-        if exams_raw: report.append("📝 *الاختبارات:*\n" + "\n".join(fmt(e) for e in _merge_exams(exams_raw)))
-        if assignments: report.append("⚠️ *التكاليف:*\n" + "\n".join(fmt(e) for e in assignments))
+        if meetings:
+            report.append("🎥 *اللقاءات والمحاضرات:*\n" + "\n\n".join(fmt(e) for e in meetings))
         
-        if len(report) == 1: report.append("✅ لا يوجد مهام قادمة حالياً.")
-        if skipped: report.append(f"\n_✅ تم إخفاء {skipped} عنصر منجز_")
+        if exams_raw:
+            merged = _merge_exams(exams_raw)
+            report.append("📝 *الاختبارات:*\n" + "\n\n".join(fmt(e) for e in merged))
+            
+        if assignments:
+            report.append("⚠️ *التكاليف والواجبات:*\n" + "\n\n".join(fmt(e) for e in assignments))
+
+        if len(report) == 1:
+            report.append("✅ لا توجد مهام أو لقاءات مسجلة في تقويم هذا الشهر.")
+        
+        if skipped:
+            report.append(f"\n_✅ تم إخفاء {skipped} عنصر منجز_")
         
         return {"status": "success", "message": "\n\n".join(report)}
 
     except Exception as e:
-        log.error(f"Error: {e}")
-        return {"status": "error", "message": "⚠️ حدث خطأ أثناء الاتصال بالمودل."}
+        log.error(f"Error in run_moodle: {e}")
+        return {"status": "error", "message": "⚠️ حدث خطأ فني أثناء جلب البيانات."}
 
 # ══════════════════════════════════════════════════════════
 # 7. أوامر البوت والتشغيل (نفس هيكلية كودك مع الإصلاحات)
