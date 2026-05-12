@@ -262,22 +262,24 @@ def run_moodle(username, password) -> dict:
             elif is_assign: assignments.append(ev)
             else:           others.append(ev)
 
-        # 4. بناء التقرير
+                # 4. بناء التقرير
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         report = [f"🕐 *تقرير: {now}*\n"]
         
         def fmt(e):
-    # محاولة أخيرة لاستنتاج المادة من الرابط إذا بقيت "غير محدد"
-    course_display = e['course']
-    if course_display == "غير محدد" and "course=" in e['url']:
-        # استخراج آيدي المساق كحل بديل
-        c_id = re.search(r"course=(\d+)", e['url'])
-        if c_id: course_display = f"مساق رقم ({c_id.group(1)})"
-    
-    time_str = f"📅 {e['time']}" if e['time'] else "📅 (تفقد الساعة بالداخل)"
-    return f"▪️ *{e['name']}*\n   📌 {course_display}\n   {time_str}"
+            # محاولة استخراج اسم المادة من الرابط إذا لم تكن موجودة في النص
+            course_display = e['course']
+            if (course_display == "غير محدد" or not course_display) and "course=" in e['url']:
+                c_id_match = re.search(r"id=(\d+)", e['url']) or re.search(r"course=(\d+)", e['url'])
+                if c_id_match:
+                    course_display = f"مساق رقم ({c_id_match.group(1)})"
+            
+            # تنسيق الوقت
+            time_display = e['time'] if e['time'] else "يُرجى فحص الرابط"
+            
+            return f"▪️ *{e['name']}*\n   📌 {course_display}\n   📅 {time_display}"
 
-
+        # إضافة الأقسام للتقرير
         if meetings:
             report.append("🎥 *اللقاءات والمحاضرات:*\n" + "\n\n".join(fmt(e) for e in meetings))
         
