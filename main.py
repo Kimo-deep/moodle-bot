@@ -6,7 +6,7 @@ import telebot
 from telebot import types
 
 # ══════════════════════════════════════════════════════════
-# 1. الإعدادات
+# 1. الإعدادات والتهيئية
 # ══════════════════════════════════════════════════════════
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -17,7 +17,7 @@ DB_PATH = "/app/data/users.db"
 FREE_TRIAL_END = datetime(2026, 6, 1)
 
 bot = telebot.TeleBot(TOKEN)
-_DONE_KW = ["تم التسليم", "submitted", "تخطى", "سلمت", "تم الإرسال", "attempt already", "انتهى", "closed", "finished"]
+_DONE_KW = ["تم التسليم", "submitted", "تخطى", "سلمت", "تم الإرسال", "attempt already", "انتهى", "closed", "finished", "محملة للتقييم"]
 
 # ══════════════════════════════════════════════════════════
 # 2. قاعدة البيانات
@@ -58,21 +58,20 @@ def check_access(chat_id: int):
     return False
 
 # ══════════════════════════════════════════════════════════
-# 3. منطق معالجة الأحداث (Moodle Processing)
+# 3. منطق المودل المطور
 # ══════════════════════════════════════════════════════════
-def _quick_done(text: str) -> bool:
-    return any(k.lower() in text.lower() for k in _DONE_KW)
-
 def _assign_done(session, url: str) -> bool:
     try:
         res = session.get(url, timeout=10).text.lower()
-        return any(k in res for k in ["تعديل التسليم", "إزالة التسليم", "edit submission", "submitted for grading", "محملة للتقييم"])
+        # فحص شامل لنصوص حالة التسليم
+        indicators = ["تعديل التسليم", "إزالة التسليم", "edit submission", "submitted for grading", "محملة للتقييم", "you have submitted", "تم تقديم"]
+        return any(k in res for k in indicators)
     except: return False
 
 def _quiz_done(session, url: str) -> bool:
     try:
         res = session.get(url, timeout=10).text.lower()
-        return any(k in res for k in ["review", "مراجعة", "درجتك", "grade", "لقد أنهيت", "no more attempts"])
+        return any(k in res for k in ["review", "مراجعة", "درجتك", "grade", "لقد أنهيت", "لا توجد محاولات"])
     except: return False
 
 def _extract_event(ev) -> dict:
@@ -83,35 +82,33 @@ def _extract_event(ev) -> dict:
         raw_name = atag.get("title") or atag.get_text(strip=True)
         url = atag.get("href", "")
         
-        # استخراج المادة
+        # --- استخراج اسم المساق بذكاء ---
         course = "غير محدد"
-        if "من مساق" in raw_name:
-            course = raw_name.split("من مساق")[-1].strip()
-        elif atag.get("title") and "course" in atag["title"].lower():
-            course = atag["title"].split("course")[-1].replace("is due for the", "").strip()
-
-        # استخراج الوقت من "يوم" التقويم
+        title_attr = atag.get("title", "")
+        if "course" in title_attr.lower():
+            # سحب ما بعد كلمة course
+            course = title_attr.lower().split("course")[-1].replace("is due for the", "").strip().capitalize()
+        elif "مساق" in title_attr:
+            course = title_attr.split("مساق")[-1].strip()
+        
+        # استخراج يوم التقويم
         time_val = ""
         cell = ev.find_parent("td", class_="day")
         if cell:
             day_num = cell.find(class_="day-number")
             if day_num: time_val = f"يوم {day_num.get_text(strip=True)}"
 
-        # تنظيف الاسم من الكلمات الدليلية
         clean_name = re.sub(r"(يُفتح|يفتح|يُغلق|يغلق|مستحق|opens|closes|is due).*", "", raw_name, flags=re.I).strip()
-        
         return {"name": clean_name, "course": course, "url": url, "time": time_val}
     except: return None
 
 def _merge_events(events: list) -> list:
-    """دمج الأحداث المتكررة بناءً على الاسم والمادة"""
     unique = {}
     for ev in events:
         key = (ev["name"].strip().lower(), ev["course"].strip().lower())
         if key not in unique:
             unique[key] = ev
         else:
-            # تحديث الوقت إذا كان متاحاً في نسخة وغير متاح في أخرى
             if not unique[key]["time"] and ev["time"]:
                 unique[key]["time"] = ev["time"]
     return list(unique.values())
@@ -123,17 +120,14 @@ def run_moodle(username, password) -> dict:
     session = requests.Session()
     session.headers["User-Agent"] = "Mozilla/5.0"
     try:
-        # تسجيل الدخول
         login_pg = session.get("https://moodle.alaqsa.edu.ps/login/index.php", timeout=20).text
-        soup_login = BeautifulSoup(login_pg, "html.parser")
-        token = soup_login.find("input", {"name": "logintoken"})
-        if not token: return {"status": "error", "message": "⚠️ المودل لا يستجيب حالياً."}
+        token = BeautifulSoup(login_pg, "html.parser").find("input", {"name": "logintoken"})
+        if not token: return {"status": "error", "message": "⚠️ المودل لا يستجيب."}
         
         resp = session.post("https://moodle.alaqsa.edu.ps/login/index.php", 
                             data={"username": username, "password": password, "logintoken": token["value"]}, timeout=20)
         if "login" in resp.url: return {"status": "fail", "message": "❌ بياناتك خاطئة."}
 
-        # جلب التقويم
         cal_html = session.get("https://moodle.alaqsa.edu.ps/calendar/view.php?view=month", timeout=20).text
         soup = BeautifulSoup(cal_html, "html.parser")
         
@@ -150,16 +144,21 @@ def run_moodle(username, password) -> dict:
             ev = _extract_event(container or link)
             if not ev: continue
             
-            if _quick_done(ev["name"]): skipped += 1; continue
-            
             url_l = ev["url"].lower()
-            if "assign" in url_l:
+            name_l = ev["name"].lower()
+            
+            # تصنيف دقيق يشمل الامتحانات
+            is_quiz = "quiz" in url_l or "test" in url_l or any(x in name_l for x in ["امتحان", "اختبار", "كويز"])
+            is_assign = "assign" in url_l or any(x in name_l for x in ["تكليف", "واجب", "تجربة", "experiment"])
+            is_meet = any(x in url_l for x in ["zoom", "meet", "bigbluebutton", "لقاء"])
+
+            if is_assign:
                 if _assign_done(session, ev["url"]): skipped += 1; continue
                 assignments.append(ev)
-            elif "quiz" in url_l:
+            elif is_quiz:
                 if _quiz_done(session, ev["url"]): skipped += 1; continue
                 exams_raw.append(ev)
-            elif any(x in url_l for x in ["zoom", "meet", "bigbluebutton"]):
+            elif is_meet:
                 meetings.append(ev)
 
         # بناء التقرير
@@ -171,22 +170,18 @@ def run_moodle(username, password) -> dict:
             if c == "غير محدد" and "id=" in e['url']:
                 cid = re.search(r"id=(\d+)", e['url'])
                 c = f"مساق ({cid.group(1)})" if cid else c
-            t = e['time'] if e['time'] else "راجع الرابط"
-            return f"▪️ *{e['name']}*\n   📌 {c}\n   📅 {t}"
+            return f"▪️ *{e['name']}*\n   📌 {c}\n   📅 {e['time'] or 'راجع الرابط'}"
 
-        if meetings:
-            report.append("🎥 *اللقاءات والمحاضرات:*\n" + "\n\n".join(fmt(e) for e in _merge_events(meetings)))
-        if exams_raw:
-            report.append("📝 *الاختبارات:*\n" + "\n\n".join(fmt(e) for e in _merge_events(exams_raw)))
-        if assignments:
-            report.append("⚠️ *التكاليف والواجبات:*\n" + "\n\n".join(fmt(e) for e in _merge_events(assignments)))
+        if meetings: report.append("🎥 *اللقاءات:*\n" + "\n\n".join(fmt(e) for e in _merge_events(meetings)))
+        if exams_raw: report.append("📝 *الاختبارات:*\n" + "\n\n".join(fmt(e) for e in _merge_events(exams_raw)))
+        if assignments: report.append("⚠️ *التكاليف:*\n" + "\n\n".join(fmt(e) for e in _merge_events(assignments)))
         
-        if len(report) == 1: report.append("✅ لا توجد مهام حالياً.")
-        if skipped: report.append(f"\n_✅ تم إخفاء {skipped} عنصر منجز_")
+        if len(report) == 1: report.append("✅ لا توجد مهام قادمة حالياً.")
+        if skipped: report.append(f"\n_✅ تم إخفاء {skipped} عنصر منجز/مسلم_")
         
         return {"status": "success", "message": "\n\n".join(report)}
     except Exception as e:
-        log.error(f"Global Error: {e}")
+        log.error(f"Error: {e}")
         return {"status": "error", "message": "⚠️ حدث خطأ فني أثناء الفحص."}
 
 # ══════════════════════════════════════════════════════════
@@ -196,14 +191,13 @@ def run_moodle(username, password) -> dict:
 def cmd_start(m):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🔍 فحص الآن", "📊 حالتي")
-    bot.send_message(m.chat.id, "🎓 بوت مودل الأقصى المطور جاهز لخدمتك.", reply_markup=kb)
+    bot.send_message(m.chat.id, "🎓 بوت مودل الأقصى المطور جاهز.", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text == "🔍 فحص الآن")
 def bot_check(m):
     if not check_access(m.chat.id): return bot.send_message(m.chat.id, "🚫 انتهى اشتراكك.")
     with get_db() as conn:
         row = conn.execute("SELECT username, password FROM users WHERE chat_id=?", (m.chat.id,)).fetchone()
-    
     if row and row["username"]:
         wait = bot.send_message(m.chat.id, "🔍 جاري فحص التقويم الشهري...")
         res = run_moodle(row["username"], row["password"])
@@ -214,12 +208,12 @@ def bot_check(m):
 
 def _reg_user(m):
     u = m.text
-    bot.send_message(m.chat.id, "🔐 أرسل كلمة مرور المودل:")
+    bot.send_message(m.chat.id, "🔐 أرسل كلمة المرور:")
     bot.register_next_step_handler(m, lambda msg: _reg_fin(msg, u))
 
 def _reg_fin(m, u):
     p = m.text
-    wait = bot.send_message(m.chat.id, "⚙️ جاري التحقق من البيانات...")
+    wait = bot.send_message(m.chat.id, "⚙️ جاري التحقق...")
     res = run_moodle(u, p)
     if res["status"] == "success":
         with get_db() as conn:
@@ -240,7 +234,7 @@ def broadcast_loop():
                 if res["status"] == "success":
                     h = hashlib.md5(res["message"].encode()).hexdigest()
                     if u["last_hash"] != h:
-                        bot.send_message(u["chat_id"], "🔔 *تحديث جديد من المودل:*\n\n" + res["message"], parse_mode="Markdown")
+                        bot.send_message(u["chat_id"], "🔔 *تحديث جديد:*\n\n" + res["message"], parse_mode="Markdown")
                         with get_db() as conn:
                             conn.execute("UPDATE users SET last_hash=? WHERE chat_id=?", (h, u["chat_id"]))
         except: pass
