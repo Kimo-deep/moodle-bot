@@ -46,176 +46,96 @@ def init_db():
             );
         """)
 
-def check_access(chat_id: int):
-    if datetime.now() < FREE_TRIAL_END: return True
-    with get_db() as conn:
-        row = conn.execute("SELECT expiry_date, is_vip FROM users WHERE chat_id=?", (chat_id,)).fetchone()
-    if row:
-        if row["is_vip"]: return True
-        if row["expiry_date"] and datetime.strptime(row["expiry_date"], "%Y-%m-%d %H:%M:%S") > datetime.now():
-            return True
-    return False
-
 # ══════════════════════════════════════════════════════════
-# 3. منطق الفحص الدقيق (Surgical Check)
-# ══════════════════════════════════════════════════════════
-def _assign_done(session, url: str) -> bool:
-    """فحص هل التكليف تم تسليمه فعلاً أم لا"""
-    try:
-        res_html = session.get(url, timeout=10).text
-        soup = BeautifulSoup(res_html, "html.parser")
-        # البحث في جدول حالة التسليم
-        status_table = soup.find("table", class_="generaltable")
-        if status_table:
-            text = status_table.get_text().lower()
-            # الكلمات القاطعة للتسليم
-            if any(k in text for k in ["submitted for grading", "تم تقديمها للتقييم", "محملة للتقييم", "submitted", "سلمت"]):
-                return True
-        return False
-    except: return False
-
-def _quiz_done(session, url: str) -> bool:
-    """فحص هل تم إنهاء الاختبار"""
-    try:
-        res_html = session.get(url, timeout=10).text
-        # إذا وجد زر "مراجعة" أو نص "لا توجد محاولات أخرى"
-        if any(k in res_html.lower() for k in ["review", "مراجعة", "no more attempts", "درجتك", "grade"]):
-            return True
-        return False
-    except: return False
-
-def _extract_event(ev) -> dict:
-    try:
-        atag = ev.find("a", {"data-action": "view-event"}) or ev.find("a", href=True)
-        if not atag: return None
-        
-        raw_name = atag.get("title") or atag.get_text(strip=True)
-        url = atag.get("href", "")
-        
-        # استخراج اسم المساق من الـ Breadcrumbs أو العنوان
-        course = "غير محدد"
-        title_attr = atag.get("title", "")
-        if "مساق" in title_attr:
-            course = title_attr.split("مساق")[-1].strip()
-        elif "course" in title_attr.lower():
-            course = title_attr.lower().split("course")[-1].replace("is due for the", "").strip().upper()
-
-        # استخراج اليوم
-        time_val = ""
-        cell = ev.find_parent("td", class_="day")
-        if cell:
-            day_num = cell.find(class_="day-number")
-            if day_num: time_val = f"يوم {day_num.get_text(strip=True)}"
-
-        clean_name = re.sub(r"(يُفتح|يفتح|يُغلق|يغلق|مستحق|opens|closes|is due).*", "", raw_name, flags=re.I).strip()
-        return {"name": clean_name, "course": course, "url": url, "time": time_val}
-    except: return None
-
-def _merge_events(events: list) -> list:
-    unique = {}
-    for ev in events:
-        key = (ev["name"].strip().lower(), ev["course"].strip().lower())
-        if key not in unique:
-            unique[key] = ev
-        else:
-            if not unique[key]["time"] and ev["time"]:
-                unique[key]["time"] = ev["time"]
-    return list(unique.values())
-
-# ══════════════════════════════════════════════════════════
-# 4. المحرك الرئيسي
+# 3. محرك الـ Upcoming الأصلي
 # ══════════════════════════════════════════════════════════
 def run_moodle(username, password) -> dict:
     session = requests.Session()
     session.headers["User-Agent"] = "Mozilla/5.0"
     try:
+        # تسجيل الدخول
         login_pg = session.get("https://moodle.alaqsa.edu.ps/login/index.php", timeout=20).text
-        token = BeautifulSoup(login_pg, "html.parser").find("input", {"name": "logintoken"})
+        soup_login = BeautifulSoup(login_pg, "html.parser")
+        token = soup_login.find("input", {"name": "logintoken"})
         if not token: return {"status": "error", "message": "⚠️ المودل لا يستجيب."}
         
-        session.post("https://moodle.alaqsa.edu.ps/login/index.php", 
-                     data={"username": username, "password": password, "logintoken": token["value"]}, timeout=20)
+        resp = session.post("https://moodle.alaqsa.edu.ps/login/index.php", 
+                            data={"username": username, "password": password, "logintoken": token["value"]}, timeout=20)
         
-        cal_html = session.get("https://moodle.alaqsa.edu.ps/calendar/view.php?view=month", timeout=20).text
-        soup = BeautifulSoup(cal_html, "html.parser")
-        
-        event_links = soup.find_all("a", {"data-action": "view-event"})
-        exams, assigns, meets = [], [], []
-        skipped, processed_ids = 0, set()
+        if "login" in resp.url: return {"status": "fail", "message": "❌ بياناتك خاطئة."}
 
-        for link in event_links:
-            ev_id = link.get("data-event-id")
-            if ev_id in processed_ids: continue
-            processed_ids.add(ev_id)
+        # جلب المهام القادمة (Upcoming)
+        up_html = session.get("https://moodle.alaqsa.edu.ps/calendar/view.php?view=upcoming", timeout=20).text
+        soup = BeautifulSoup(up_html, "html.parser")
+        
+        event_items = soup.find_all("div", class_="event")
+        if not event_items:
+            return {"status": "success", "message": "✅ لا توجد مهام قادمة حالياً."}
+
+        report = [f"🕐 *تقرير المهام القادمة: {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n"]
+
+        for item in event_items:
+            # اسم المهمة
+            name = item.find("h3").get_text(strip=True) if item.find("h3") else "مهمة غير معروفة"
             
-            ev = _extract_event(link.find_parent("div") or link)
-            if not ev: continue
+            # استخراج اسم المادة والوقت
+            details = item.find_all("div", class_="row")
+            course = "غير محدد"
+            due_time = "غير محدد"
             
-            u, n = ev["url"].lower(), ev["name"].lower()
-            
-            # التصنيف
-            if "quiz" in u or any(x in n for x in ["امتحان", "اختبار", "كويز"]):
-                if _quiz_done(session, ev["url"]): skipped += 1
-                else: exams.append(ev)
-            elif "assign" in u or any(x in n for x in ["تكليف", "واجب", "تجربة", "experiment"]):
-                if _assign_done(session, ev["url"]): skipped += 1
-                else: assigns.append(ev)
-            elif any(x in u for x in ["zoom", "meet", "bigbluebutton"]):
-                meets.append(ev)
+            for row in details:
+                text = row.get_text().strip()
+                if "المساق" in text or "Course" in text:
+                    course = text.split("المساق")[-1].strip() if "المساق" in text else text.split("Course")[-1].strip()
+                if "متى" in text or "When" in text:
+                    due_time = text.split("متى")[-1].strip() if "متى" in text else text.split("When")[-1].strip()
 
-        # التقرير
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        report = [f"🕐 *تقرير: {now}*\n"]
+            report.append(f"▪️ *{name}*\n   📌 {course}\n   📅 {due_time}")
 
-        def fmt(e):
-            return f"▪️ *{e['name']}*\n   📌 {e['course']}\n   📅 {e['time'] or 'راجع الرابط'}"
-
-        if meets: report.append("🎥 *اللقاءات:*\n" + "\n\n".join(fmt(e) for e in _merge_events(meets)))
-        if exams: report.append("📝 *الاختبارات:*\n" + "\n\n".join(fmt(e) for e in _merge_events(exams)))
-        if assigns: report.append("⚠️ *التكاليف:*\n" + "\n\n".join(fmt(e) for e in _merge_events(assigns)))
-        
-        if len(report) == 1: report.append("✅ لا يوجد مهام قادمة.")
-        if skipped: report.append(f"\n_✅ تم إخفاء {skipped} عنصر منجز_")
-        
         return {"status": "success", "message": "\n\n".join(report)}
-    except:
-        return {"status": "error", "message": "⚠️ فشل في الاتصال."}
+    except Exception as e:
+        log.error(f"Moodle Error: {e}")
+        return {"status": "error", "message": "⚠️ حدث خطأ أثناء الاتصال بالمودل."}
 
 # ══════════════════════════════════════════════════════════
-# 5. دوال البوت (نفس الهيكل السابق)
+# 4. دوال البوت الأساسية
 # ══════════════════════════════════════════════════════════
 @bot.message_handler(commands=["start"])
 def cmd_start(m):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("🔍 فحص الآن", "📊 حالتي")
-    bot.send_message(m.chat.id, "🎓 بوت مودل الأقصى المطور.", reply_markup=kb)
+    kb.row("🔍 فحص المهام", "📊 حالتي")
+    bot.send_message(m.chat.id, "🎓 أهلاً بك في بوت مودل الأقصى (النسخة الأصلية).", reply_markup=kb)
 
-@bot.message_handler(func=lambda m: m.text == "🔍 فحص الآن")
+@bot.message_handler(func=lambda m: m.text == "🔍 فحص المهام")
 def bot_check(m):
     with get_db() as conn:
         row = conn.execute("SELECT username, password FROM users WHERE chat_id=?", (m.chat.id,)).fetchone()
+    
     if row:
-        wait = bot.send_message(m.chat.id, "🔍 جاري الفحص الدقيق...")
+        wait = bot.send_message(m.chat.id, "🔄 جاري جلب المهام القادمة...")
         res = run_moodle(row["username"], row["password"])
-        bot.edit_message_text(res["message"], m.chat.id, wait.message_id, parse_mode="Markdown", disable_web_page_preview=True)
+        bot.edit_message_text(res["message"], m.chat.id, wait.message_id, parse_mode="Markdown")
     else:
-        bot.send_message(m.chat.id, "أرسل الرقم الجامعي للربط:")
+        bot.send_message(m.chat.id, "📧 يرجى إرسال رقمك الجامعي للربط:")
         bot.register_next_step_handler(m, _reg_user)
 
 def _reg_user(m):
     u = m.text
-    bot.send_message(m.chat.id, "أرسل كلمة المرور:")
+    bot.send_message(m.chat.id, "🔐 الآن أرسل كلمة المرور:")
     bot.register_next_step_handler(m, lambda msg: _reg_fin(msg, u))
 
 def _reg_fin(m, u):
     p = m.text
+    wait = bot.send_message(m.chat.id, "⚙️ يتم التحقق...")
     res = run_moodle(u, p)
     if res["status"] == "success":
         with get_db() as conn:
             conn.execute("INSERT OR REPLACE INTO users (chat_id, username, password) VALUES (?,?,?)", (m.chat.id, u, p))
-        bot.send_message(m.chat.id, "✅ تم الربط!\n\n" + res["message"], parse_mode="Markdown")
-    else: bot.send_message(m.chat.id, "❌ خطأ في البيانات.")
+        bot.send_message(m.chat.id, "✅ تم الربط بنجاح!\n\n" + res["message"], parse_mode="Markdown")
+    else:
+        bot.send_message(m.chat.id, res["message"])
 
 if __name__ == "__main__":
     init_db()
+    log.info("Bot is running...")
     bot.infinity_polling()
