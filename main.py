@@ -1223,29 +1223,30 @@ def broadcast_reports():
 
         res = run_moodle(user, pwd)
         if res["status"] != "success": continue
-        if not res.get("has_content"): continue   # لا يرسل إذا لا يوجد شيء
+        
+        # ملاحظة: إذا كنت تريد الإرسال حتى لو لم يكن هناك واجبات (رسالة "لا يوجد مهام")
+        # قم بإلغاء تفعيل السطر التالي أو تعديله.
+        if not res.get("has_content"): continue 
 
         msg = res["message"]
-        h   = hashlib.md5(msg.encode()).hexdigest()
-
-        with get_db() as conn:
-            old = conn.execute(
-                "SELECT last_hash FROM users WHERE chat_id=?", (uid,)
-            ).fetchone()
-            if old and old["last_hash"] == h:
-                continue   # نفس المحتوى تماماً — لا ترسل
-            try:
-                bot.send_message(
-                    uid,
-                    f"🔔 *تقرير المودل:*\n\n{msg}",
-                    parse_mode="Markdown",
-                )
+        
+        # --- تم حذف التحقق من الـ Hash من هنا ---
+        
+        try:
+            bot.send_message(
+                uid,
+                f"🔔 *تقرير المودل الدوري:*\n\n{msg}",
+                parse_mode="Markdown",
+            )
+            
+            # تحديث وقت آخر تقرير فقط (اختياري)
+            with get_db() as conn:
                 conn.execute(
-                    "UPDATE users SET last_hash=?, last_report=? WHERE chat_id=?",
-                    (h, datetime.now().strftime("%Y-%m-%d %H:%M"), uid),
+                    "UPDATE users SET last_report=? WHERE chat_id=?",
+                    (datetime.now().strftime("%Y-%m-%d %H:%M"), uid),
                 )
-            except Exception as e:
-                log.warning(f"فشل إرسال تقرير لـ {uid}: {e}")
+        except Exception as e:
+            log.warning(f"فشل إرسال تقرير لـ {uid}: {e}")
 
 # ══════════════════════════════════════════════════════════
 # 26. المُجدوِل
@@ -1267,4 +1268,3 @@ if __name__ == "__main__":
     threading.Thread(target=_scheduler, daemon=True).start()
     log.info("✅ البوت يعمل…")
     bot.infinity_polling(timeout=30, long_polling_timeout=20)
-
