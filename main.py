@@ -1267,3 +1267,4 @@ if __name__ == "__main__":
     threading.Thread(target=_scheduler, daemon=True).start()
     log.info("✅ البوت يعمل…")
     bot.infinity_polling(timeout=30, long_polling_timeout=20)
+
