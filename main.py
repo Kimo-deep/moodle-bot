@@ -1080,50 +1080,47 @@ def cmd_userinfo(m):
 
 @bot.message_handler(commands=["report_all"])
 def cmd_report_all(m):
-    """/report_all — تقرير فوري لكل المستخدمين بغض النظر عن last_hash"""
-    if not _adm(m): return
-    wm = bot.send_message(m.chat.id, "📤 جاري إرسال التقارير…")
+    if not _admin(m): return
+    
+    bot.send_message(m.chat.id, "🚀 جاري فحص وإرسال التقارير للجميع، قد يستغرق الأمر وقتاً...")
+    
     with get_db() as conn:
         users = conn.execute(
-            "SELECT chat_id, username, password FROM users"
-            " WHERE username IS NOT NULL"
+            "SELECT chat_id, username, password FROM users WHERE username IS NOT NULL"
         ).fetchall()
-    ok = fail = skip = 0
+
+    success_count = 0
+    fail_count = 0
+
     for row in users:
         uid, user, pwd = row["chat_id"], row["username"], row["password"]
-        if not check_access(uid)[0]:
-            skip += 1; continue
+        
+        # التأكد من صلاحية الاشتراك
+        if not check_access(uid)[0]: continue
+
         res = run_moodle(user, pwd)
-        if res["status"] == "success" and res["has_content"]:
+        if res["status"] == "success":
             try:
-                bot.send_message(
-                    uid,
-                    f"🔔 *تقرير المودل (يدوي):*\n\n{res['message']}",
-                    parse_mode="Markdown",
-                )
-                h = hashlib.md5(res["message"].encode()).hexdigest()
+                bot.send_message(uid, f"🔔 *تحديث فوري من الإدارة:*\n\n{res['message']}", 
+                                 parse_mode="Markdown")
+                success_count += 1
+                
+                # تحديث قاعدة البيانات
                 with get_db() as conn:
                     conn.execute(
-                        "UPDATE users SET last_hash=?, last_report=?"
-                        " WHERE chat_id=?",
-                        (h, datetime.now().strftime("%Y-%m-%d %H:%M"), uid),
+                        "UPDATE users SET last_report=? WHERE chat_id=?",
+                        (datetime.now().strftime("%Y-%m-%d %H:%M"), uid)
                     )
-                ok += 1
             except Exception:
-                fail += 1
+                fail_count += 1
         else:
-            skip += 1
-    try:
-        bot.edit_message_text(
-            f"✅ *report_all انتهى*\n\n"
-            f"📨 أُرسل: {ok}\n"
-            f"⏭️ تخطى: {skip}\n"
-            f"❌ فشل: {fail}",
-            m.chat.id, wm.message_id,
-            parse_mode="Markdown",
-        )
-    except Exception:
-        pass
+            fail_count += 1
+
+    bot.send_message(m.chat.id, 
+                     f"✅ اكتمل الإرسال الجماعي:\n"
+                     f"🟢 تم بنجاح: {success_count}\n"
+                     f"🔴 فشل/حظر: {fail_count}")
+
 
 @bot.message_handler(commands=["holiday"])
 def cmd_holiday(m):
