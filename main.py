@@ -230,20 +230,35 @@ def _get_time(ev) -> str:
 def _get_course_doctor(ev) -> tuple:
     raw = ""
 
-    # 1. col-11 الثاني (الأول وقت، الثاني مادة+دكتور)
+    # 1. كل col-11 — خذ الأول اللي مش وقت
     cols = ev.select(".col-11")
+    time_found = False
     for col in cols:
         t = col.get_text(" ", strip=True)
-        # تخطى إذا هو وقت أو فارغ
-        if not t or any(w in t for w in ["اليوم", "غدًا", "غداً", "AM", "PM"]):
+        if not t:
             continue
-        if _TIME_RE.search(t):
+        # الأول اللي فيه وقت → تخطى (هو حقل الوقت)
+        is_time = (
+            _TIME_RE.search(t)
+            or any(w in t for w in ["اليوم", "غدًا", "غداً", "AM", "PM", "ص", "م"])
+        )
+        if is_time:
+            time_found = True
             continue
-        if len(t) > 4:
+        # بعد ما شفنا الوقت، أول نص حقيقي هو المادة+الدكتور
+        if time_found and len(t) > 4:
             raw = t
             break
 
-    # 2. fallback: رابط href يحتوي "course"
+    # 2. fallback: أي col-11 فيه اسم مادة (يحتوي أ. أو د.)
+    if not raw:
+        for col in cols:
+            t = col.get_text(" ", strip=True)
+            if re.search(r"[أاد]\.", t) and len(t) > 4:
+                raw = t
+                break
+
+    # 3. fallback: select من قائمة المساقات في الـ select
     if not raw:
         for a in ev.find_all("a", href=True):
             if "course" in a.get("href", ""):
@@ -255,7 +270,7 @@ def _get_course_doctor(ev) -> tuple:
     if not raw:
         return "غير محدد", "غير محدد"
 
-    # فصل الدكتور: "برمجة مرئية أ.محمود" أو "د.أشرف عبد الله"
+    # فصل الدكتور
     doc_m = re.search(
         r"\s*[أادD]\.\s*([\u0600-\u06FF][\u0600-\u06FF\s]{2,35}?)\s*$",
         raw
