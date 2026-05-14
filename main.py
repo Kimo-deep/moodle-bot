@@ -189,40 +189,27 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 # ══════════════════════════════════════════════════════════
-# 6. استخراج الوقت
-#    مودل الأقصى يضع الوقت في:
-#      <div class="date">الاثنين, 11 مايو, 2:00 PM</div>
-#    أو في <time datetime="2026-05-11T14:00:00">
 # ══════════════════════════════════════════════════════════
-_DAYS_AR   = ["الاثنين","الثلاثاء","الأربعاء","الخميس","الجمعة","السبت","الأحد"]
-_MONTHS_AR = ["","يناير","فبراير","مارس","أبريل","مايو","يونيو",
-              "يوليو","أغسطس","سبتمبر","أكتوبر","نوفمبر","ديسمبر"]
-
-def _dt_arabic(dt: datetime) -> str:
-    hr   = dt.strftime("%I:%M").lstrip("0") or "12"
-    ampm = "AM" if dt.hour < 12 else "PM"
-    return (f"{_DAYS_AR[dt.weekday()]}, {dt.day} "
-            f"{_MONTHS_AR[dt.month]}, {hr} {ampm}")
-
+# 6. استخراج الوقت — مودل الأقصى
+# ══════════════════════════════════════════════════════════
 def _get_time(ev) -> str:
-    """يستخرج الوقت من الحدث بدون أن يخلط مع نص المادة."""
-    # استنسخ بدون div.description و small لمنع الخلط
-    clone = BeautifulSoup(str(ev), "html.parser")
-    for sel in ["div.description", ".description", "small"]:
-        for tag in clone.select(sel):
-            tag.decompose()
+    # 1. col-11 text-danger (الوقت دائماً أحمر في مودل الأقصى)
+    tag = ev.select_one(".col-11.text-danger")
+    if tag:
+        t = tag.get_text(" ", strip=True)
+        if t: return t
 
-    # 1. عنصر .date أو مشابه
-    for sel in [".date", ".event-date", "[class*='date']"]:
-        tag = clone.select_one(sel)
-        if tag:
-            t = tag.get_text(" ", strip=True)
-            m = _TIME_RE.search(t)
-            if m:
-                return m.group(0).strip()
+    # 2. أول col-11 يحتوي وقتاً (اليوم / غدًا / يوم + ساعة)
+    for tag in ev.select(".col-11"):
+        t = tag.get_text(" ", strip=True)
+        m = _TIME_RE.search(t)
+        if m: return m.group(0).strip()
+        # نص بسيط مثل "اليوم، 14 مايو، 11:59 PM"
+        if any(w in t for w in ["اليوم", "غدًا", "غداً", "AM", "PM"]):
+            return t
 
-    # 2. عنصر <time datetime="...">
-    for tag in clone.find_all("time"):
+    # 3. <time datetime="...">
+    for tag in ev.find_all("time"):
         dt_str = tag.get("datetime", "")
         if dt_str:
             try:
@@ -232,52 +219,46 @@ def _get_time(ev) -> str:
                 return _dt_arabic(dt)
             except Exception:
                 pass
-        t = tag.get_text(" ", strip=True)
-        m = _TIME_RE.search(t)
-        if m:
-            return m.group(0).strip()
 
-    # 3. آخر تطابق في باقي النص
-    raw     = clone.get_text(" ", strip=True)
-    matches = _TIME_RE.findall(raw)
-    return matches[-1].strip() if matches else ""
+    return ""
+
 
 # ══════════════════════════════════════════════════════════
-# 7. استخراج المادة والدكتور
-#    مودل الأقصى يضع المادة في:
-#      <a href="...course/view.php?id=N">اسم المادة أ.اسم الدكتور</a>
+# 7. استخراج المادة والدكتور — مودل الأقصى
+#    البنية: <div class="col-11">برمجة مرئية أ.محمود مسعود عاشور</div>
 # ══════════════════════════════════════════════════════════
 def _get_course_doctor(ev) -> tuple:
     raw = ""
 
-    # 1. رابط href يحتوي "course" — المصدر الأساسي
-    for a in ev.find_all("a", href=True):
-        href = a.get("href", "")
-        if "course" in href:
-            t = a.get_text(" ", strip=True)
-            if t and len(t) > 4 and not _TIME_RE.search(t):
-                raw = t
-                break
+    # 1. col-11 الثاني (الأول وقت، الثاني مادة+دكتور)
+    cols = ev.select(".col-11")
+    for col in cols:
+        t = col.get_text(" ", strip=True)
+        # تخطى إذا هو وقت أو فارغ
+        if not t or any(w in t for w in ["اليوم", "غدًا", "غداً", "AM", "PM"]):
+            continue
+        if _TIME_RE.search(t):
+            continue
+        if len(t) > 4:
+            raw = t
+            break
 
-    # 2. text nodes مباشرة في description
+    # 2. fallback: رابط href يحتوي "course"
     if not raw:
-        desc = ev.select_one("div.description") or ev.select_one(".description")
-        if desc:
-            for node in desc.children:
-                if isinstance(node, NavigableString):
-                    t = str(node).strip()
-                    if (t and len(t) > 4
-                            and not _TIME_RE.search(t)
-                            and not any(n in t for n in _NOISE)):
-                        raw = t
-                        break
+        for a in ev.find_all("a", href=True):
+            if "course" in a.get("href", ""):
+                t = a.get_text(" ", strip=True)
+                if t and len(t) > 4 and not _TIME_RE.search(t):
+                    raw = t
+                    break
 
     if not raw:
         return "غير محدد", "غير محدد"
 
-    # فصل الدكتور: "خوارزميات متقدمة أ.فراس فؤاد العجلة"
+    # فصل الدكتور: "برمجة مرئية أ.محمود" أو "د.أشرف عبد الله"
     doc_m = re.search(
-        r"\s*[أا]\.\s*([\u0600-\u06FF][\u0600-\u06FF\s]{2,30}?)\s*$", raw
+        r"\s*[أادD]\.\s*([\u0600-\u06FF][\u0600-\u06FF\s]{2,35}?)\s*$",
+        raw
     )
     if doc_m:
         doctor = _clean(doc_m.group(1)).strip()
@@ -286,9 +267,7 @@ def _get_course_doctor(ev) -> tuple:
         doctor = "غير محدد"
         course = _clean(raw).strip()
 
-    return (course or "غير محدد"), doctor
-
-# ══════════════════════════════════════════════════════════
+    return (course or "غير محدد"), doctor ══════════════════════════════════════════════════════════
 # 8. استخراج حدث واحد
 # ══════════════════════════════════════════════════════════
 def _parse_event(ev_div) -> dict | None:
