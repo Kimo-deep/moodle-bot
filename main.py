@@ -1080,10 +1080,11 @@ def cmd_userinfo(m):
 
 @bot.message_handler(commands=["report_all"])
 def cmd_report_all(m):
-    if not _admin(m): return
-    
+    # التعديل هنا: استخدام _adm وليس _admin
+    if not _adm(m): return 
+
     bot.send_message(m.chat.id, "🚀 جاري فحص وإرسال التقارير للجميع، قد يستغرق الأمر وقتاً...")
-    
+
     with get_db() as conn:
         users = conn.execute(
             "SELECT chat_id, username, password FROM users WHERE username IS NOT NULL"
@@ -1094,24 +1095,29 @@ def cmd_report_all(m):
 
     for row in users:
         uid, user, pwd = row["chat_id"], row["username"], row["password"]
-        
+
         # التأكد من صلاحية الاشتراك
-        if not check_access(uid)[0]: continue
+        access_ok, _ = check_access(uid)
+        if not access_ok: continue
 
         res = run_moodle(user, pwd)
         if res["status"] == "success":
             try:
+                # إرسال التقرير للمستخدم
                 bot.send_message(uid, f"🔔 *تحديث فوري من الإدارة:*\n\n{res['message']}", 
                                  parse_mode="Markdown")
                 success_count += 1
-                
-                # تحديث قاعدة البيانات
+
+                # تحديث وقت التقرير في قاعدة البيانات
                 with get_db() as conn:
                     conn.execute(
                         "UPDATE users SET last_report=? WHERE chat_id=?",
                         (datetime.now().strftime("%Y-%m-%d %H:%M"), uid)
                     )
-            except Exception:
+                # تأخير بسيط جداً لتجنب حظر التليجرام (Flood Wait)
+                time.sleep(0.1) 
+            except Exception as e:
+                log.warning(f"Failed to send to {uid}: {e}")
                 fail_count += 1
         else:
             fail_count += 1
