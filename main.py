@@ -554,8 +554,6 @@ def run_moodle(username: str, password: str) -> dict:
                 return header + "لا يوجد"
             return header + "\n\n" + "\n\n".join(items)
 
-        parts.append(_sec("📚", "المحاضرات",           lectures))
-        parts.append(_sec("🎥", "اللقاءات",             meetings))
         parts.append(_sec("📝", "الاختبارات",           exams))
         parts.append(_sec("⚠️", "التكاليف والتجارب",    assignments))
 
