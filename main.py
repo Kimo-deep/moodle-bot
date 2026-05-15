@@ -1173,8 +1173,8 @@ def cmd_stats(m):
         f"`/userinfo [id]` — معلومات مستخدم\n"
         f"`/report_all` — تقرير فوري للجميع\n"
         f"`/broadcast [نص]` — إشعار للجميع\n"
-        f"`/holiday` — تفعيل/إلغاء العطلة",
-        f"`/users` — قائمة المستخدمين\n",
+        f"`/holiday` — تفعيل/إلغاء العطلة\n"
+        f"`/users` — قائمة المستخدمين",
         parse_mode="Markdown",
     )
 
