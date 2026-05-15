@@ -1235,9 +1235,10 @@ def cmd_users(m):
 @bot.message_handler(commands=["reachable"])
 def cmd_reachable(m):
     if not _adm(m): return
+    bot.send_message(m.chat.id, "⏳ جاري الفحص...")
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT chat_id, username, telegram_username, is_vip, expiry_date "
+            "SELECT chat_id, username, is_vip, expiry_date "
             "FROM users ORDER BY chat_id"
         ).fetchall()
     if not rows:
@@ -1258,9 +1259,8 @@ def cmd_reachable(m):
         if r["is_vip"]:        sub = "🌟"
         elif r["expiry_date"]: sub = "✅"
         else:                  sub = "❌"
-        tg  = f"@{r['telegram_username']}" if r["telegram_username"] else "بدون يوزرنيم"
         uni = r["username"] or "—"
-        return f"{sub} {tg} — `{uni}` — `{r['chat_id']}`"
+        return f"{sub} `{r['chat_id']}` — `{uni}`"
 
     lines = [f"✅ *يمكن الوصول إليهم ({len(reachable)}):*\n"]
     lines += [fmt(r) for r in reachable]
