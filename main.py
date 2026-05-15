@@ -1174,6 +1174,7 @@ def cmd_stats(m):
         f"`/report_all` — تقرير فوري للجميع\n"
         f"`/broadcast [نص]` — إشعار للجميع\n"
         f"`/holiday` — تفعيل/إلغاء العطلة",
+        f"`/users` — قائمة المستخدمين\n",
         parse_mode="Markdown",
     )
 
@@ -1197,6 +1198,39 @@ def cmd_broadcast(m):
         except Exception:
             pass
     bot.send_message(m.chat.id, f"✅ أُرسلت لـ {ok}/{len(uids)} مستخدم.")
+
+@bot.message_handler(commands=["users"])
+def cmd_users(m):
+    if not _adm(m): return
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT chat_id, username, is_vip, expiry_date FROM users ORDER BY chat_id"
+        ).fetchall()
+    if not rows:
+        bot.send_message(m.chat.id, "❌ لا يوجد مستخدمون.")
+        return
+    lines = [f"👥 *المستخدمون ({len(rows)}):*\n"]
+    for r in rows:
+        if r["is_vip"]:          sub = "🌟"
+        elif r["expiry_date"]:   sub = "✅"
+        else:                    sub = "❌"
+        linked = f"`{r['username']}`" if r["username"] else "—"
+        lines.append(f"{sub} `{r['chat_id']}` — {linked}")
+    # إرسال على دفعات إذا كان الحجم كبير
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        chunks = [lines[0]]
+        for line in lines[1:]:
+            if len("\n".join(chunks + [line])) > 4000:
+                bot.send_message(m.chat.id, "\n".join(chunks), parse_mode="Markdown")
+                chunks = [line]
+            else:
+                chunks.append(line)
+        if chunks:
+            bot.send_message(m.chat.id, "\n".join(chunks), parse_mode="Markdown")
+    else:
+        bot.send_message(m.chat.id, text, parse_mode="Markdown")
+
 
 # ══════════════════════════════════════════════════════════
 # 17. التقارير الدورية كل 6 ساعات
