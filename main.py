@@ -1174,6 +1174,7 @@ def cmd_stats(m):
         f"`/report_all` — تقرير فوري للجميع\n"
         f"`/broadcast [نص]` — إشعار للجميع\n"
         f"`/holiday` — تفعيل/إلغاء العطلة\n"
+        f"`/reachable` — المستخدمين الي شغالين على البوت\n"
         f"`/users` — قائمة المستخدمين",
         parse_mode="Markdown",
     )
@@ -1217,6 +1218,55 @@ def cmd_users(m):
         linked = f"`{r['username']}`" if r["username"] else "—"
         lines.append(f"{sub} `{r['chat_id']}` — {linked}")
     # إرسال على دفعات إذا كان الحجم كبير
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        chunks = [lines[0]]
+        for line in lines[1:]:
+            if len("\n".join(chunks + [line])) > 4000:
+                bot.send_message(m.chat.id, "\n".join(chunks), parse_mode="Markdown")
+                chunks = [line]
+            else:
+                chunks.append(line)
+        if chunks:
+            bot.send_message(m.chat.id, "\n".join(chunks), parse_mode="Markdown")
+    else:
+        bot.send_message(m.chat.id, text, parse_mode="Markdown")
+
+@bot.message_handler(commands=["reachable"])
+def cmd_reachable(m):
+    if not _adm(m): return
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT chat_id, username, telegram_username, is_vip, expiry_date "
+            "FROM users ORDER BY chat_id"
+        ).fetchall()
+    if not rows:
+        bot.send_message(m.chat.id, "❌ لا يوجد مستخدمون.")
+        return
+
+    reachable = []
+    unreachable = []
+
+    for r in rows:
+        try:
+            bot.send_chat_action(r["chat_id"], "typing")
+            reachable.append(r)
+        except Exception:
+            unreachable.append(r)
+
+    def fmt(r):
+        if r["is_vip"]:        sub = "🌟"
+        elif r["expiry_date"]: sub = "✅"
+        else:                  sub = "❌"
+        tg  = f"@{r['telegram_username']}" if r["telegram_username"] else "بدون يوزرنيم"
+        uni = r["username"] or "—"
+        return f"{sub} {tg} — `{uni}` — `{r['chat_id']}`"
+
+    lines = [f"✅ *يمكن الوصول إليهم ({len(reachable)}):*\n"]
+    lines += [fmt(r) for r in reachable]
+    lines += [f"\n❌ *لا يمكن الوصول إليهم ({len(unreachable)}):*\n"]
+    lines += [fmt(r) for r in unreachable]
+
     text = "\n".join(lines)
     if len(text) > 4000:
         chunks = [lines[0]]
