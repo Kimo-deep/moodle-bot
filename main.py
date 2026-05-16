@@ -869,20 +869,21 @@ def handle_photo(m):
     try:
         uname = (f"@{m.from_user.username}"
                  if m.from_user.username else "بدون يوزرنيم")
+        caption = (
+            f"📩 طلب تفعيل يدوي\n"
+            f"👤 {uname} ({m.chat.id})\n"
+            f"📅 {datetime.now():%Y-%m-%d %H:%M}"
+        )
         bot.send_photo(
             ADMIN_ID,
             m.photo[-1].file_id,
-            caption=(f"📩 *طلب تفعيل يدوي*\n"
-                     f"👤 {uname} (`{m.chat.id}`)\n"
-                     f"📅 {datetime.now():%Y-%m-%d %H:%M}"),
+            caption=caption,
             reply_markup=kb,
-            parse_mode="Markdown",
         )
         bot.reply_to(m, "⏳ تم إرسال الإيصال. سيُشعرك الأدمن فور المراجعة.")
     except Exception as e:
         log.error(f"handle_photo: {e}")
         bot.reply_to(m, "⚠️ حدث خطأ. حاول مجدداً.")
-
 # ══════════════════════════════════════════════════════════
 # 15. Callbacks
 # ══════════════════════════════════════════════════════════
